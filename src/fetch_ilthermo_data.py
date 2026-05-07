@@ -1,13 +1,18 @@
 """
-fetch_ilthermo_data.py — Phase 1 data collection script.
+fetch_ilthermo_data.py — Phase 1 data collection script (Henry's law constant).
 
-Uses the ILThermoPy library to query ILThermo 2.0 for CO2-related
-solubility data (Henry's law constant).
+Uses the ILThermoPy library to query ILThermo 2.0 for CO2 Henry's law
+constant data in binary IL + CO2 systems.
 
 ILThermoPy is used instead of raw HTTP because:
   1. There is no official ILThermo REST API.
   2. ILThermoPy provides pre-validated SMILES for each IL, which we
      need for RDKit featurization in Phase 2.
+
+Known data quality issue (fixed here):
+  ILThermoPy sometimes returns entries where both cmp1 and cmp2 are
+  labelled 'carbon dioxide'. These are corrupt entries — we drop them
+  with a post-extraction filter on il_smiles.
 
 Input:  nothing (queries ILThermo 2.0 via ILThermoPy)
 Output: data/raw/ilthermo_co2_raw.csv
@@ -21,8 +26,8 @@ import pandas as pd
 import time
 
 HENRYS_LAW_PROP_KEY   = "lIUh"
-OSTWALD_PROP_KEY      = "eCTp"
 CO2_COMPOUND_NAME     = "carbon dioxide"
+CO2_SMILES            = "O=C=O"   # used to detect and drop corrupt rows
 REQUEST_DELAY_SECONDS = 1.0
 OUTPUT_PATH           = "data/raw/ilthermo_co2_raw.csv"
 
@@ -52,7 +57,7 @@ def extract_row_from_search_result(row, prop_label):
 
     ILThermoPy does not guarantee cmp1=IL and cmp2=CO2 — the order can be
     flipped. We detect which component is CO2 by name and always assign the
-    other one as the IL. Returns None if CO2 component can't be identified.
+    other one as the IL. Returns None if CO2 cannot be identified.
     """
     cmp1_name = row.get("cmp1", "") or ""
     cmp2_name = row.get("cmp2", "") or ""
@@ -83,48 +88,59 @@ def extract_row_from_search_result(row, prop_label):
     }
 
 
+def drop_corrupt_co2_rows(co2_datasets_df):
+    """
+    Drops rows where the 'IL' was incorrectly assigned as CO2 itself.
+
+    This happens when ILThermoPy returns entries where both components are
+    labelled 'carbon dioxide'. The extract function assigns one as the IL,
+    but it ends up with the CO2 SMILES. We catch and drop these here.
+    """
+    # Rows where il_smiles is the CO2 SMILES are corrupt — the IL was not
+    # correctly identified. Drop them and report how many were removed.
+    corrupt_mask        = co2_datasets_df["il_smiles"] == CO2_SMILES
+    num_corrupt         = corrupt_mask.sum()
+    clean_df            = co2_datasets_df[~corrupt_mask].reset_index(drop=True)
+
+    if num_corrupt > 0:
+        print(f"  DATA QUALITY: Dropped {num_corrupt} corrupt rows where "
+              f"il_smiles was CO2 (both components were 'carbon dioxide').")
+    else:
+        print(f"  DATA QUALITY: No corrupt rows found.")
+
+    return clean_df
+
+
 def fetch_all_co2_data():
     """
-    Searches ILThermo for Henry's law constant and Ostwald coefficient data
-    involving CO2, extracts IL names and SMILES, and saves to CSV.
+    Searches ILThermo for Henry's law constant data involving CO2,
+    extracts IL names and SMILES, filters corrupt rows, and saves to CSV.
     """
+    search_results_df = search_co2_datasets(HENRYS_LAW_PROP_KEY, "henrys_law_constant")
+
+    if search_results_df.empty:
+        print("\nERROR: No data found. Check ILThermoPy and network.")
+        return pd.DataFrame()
+
     all_rows = []
-
-    properties_to_fetch = [
-        (HENRYS_LAW_PROP_KEY, "henrys_law_constant"),
-        (OSTWALD_PROP_KEY,    "ostwald_coefficient"),
-    ]
-
-    for prop_key, prop_label in properties_to_fetch:
-        search_results_df = search_co2_datasets(prop_key, prop_label)
-
-        if search_results_df.empty:
-            print(f"  No data found for {prop_label}, skipping.")
-            continue
-
-        for _, row in search_results_df.iterrows():
-            flat_row = extract_row_from_search_result(row, prop_label)
-            if flat_row is not None:
-                all_rows.append(flat_row)
-
-        time.sleep(REQUEST_DELAY_SECONDS)
+    for _, row in search_results_df.iterrows():
+        flat_row = extract_row_from_search_result(row, "henrys_law_constant")
+        if flat_row is not None:
+            all_rows.append(flat_row)
 
     co2_datasets_df = pd.DataFrame(all_rows)
-
-    if co2_datasets_df.empty:
-        print("\nERROR: No data collected. Check ILThermoPy and network.")
-        return co2_datasets_df
+    co2_datasets_df = drop_corrupt_co2_rows(co2_datasets_df)
 
     print(f"\n--- Summary ---")
-    print(f"Total datasets collected: {len(co2_datasets_df)}")
+    print(f"Total clean datasets: {len(co2_datasets_df)}")
     print(f"Unique ILs: {co2_datasets_df['il_name'].nunique()}")
-    print(f"Properties: {co2_datasets_df['property'].unique()}")
 
     missing_smiles = co2_datasets_df['il_smiles'].isna().sum()
     print(f"Missing SMILES: {missing_smiles} ({100*missing_smiles/len(co2_datasets_df):.1f}%)")
 
     co2_datasets_df.to_csv(OUTPUT_PATH, index=False)
     print(f"\nSaved to: {OUTPUT_PATH}")
+    print("\nDatasets per IL:")
     print(co2_datasets_df['il_name'].value_counts().to_string())
 
     return co2_datasets_df
