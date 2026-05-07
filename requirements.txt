@@ -1,0 +1,27 @@
+# Core scientific stack
+numpy
+pandas
+scipy
+
+# Molecular cheminformatics — for SMILES parsing and Morgan fingerprints
+rdkit
+
+# Machine learning
+scikit-learn
+xgboost
+lightgbm
+joblib  # for saving/loading trained models
+
+# Bayesian optimization (Phase 4 inverse design)
+scikit-optimize
+
+# Visualization
+matplotlib
+seaborn
+
+# Jupyter notebooks (optional, for exploration)
+jupyter
+
+# HTTP requests for ILThermo data scraping
+requests
+beautifulsoup4
