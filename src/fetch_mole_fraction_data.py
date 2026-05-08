@@ -1,21 +1,23 @@
 """
 fetch_mole_fraction_data.py — Phase 1b data collection script (mole fraction solubility).
 
-Queries ILThermo for CO2 mole fraction solubility in binary IL + CO2 systems.
-This supplements the Henry's law dataset from fetch_ilthermo_data.py.
+Queries ILThermo for CO2 mole fraction solubility (composition at phase
+equilibrium) in binary IL + CO2 systems. Supplements the Henry's law
+dataset from fetch_ilthermo_data.py.
 
 Why mole fraction solubility?
-  Our Henry's law search returned only 14 unique ILs — far too few for ML.
-  Mole fraction solubility (x2) is a different but related property that
-  covers more ILs in ILThermo. Both measure how much CO2 an IL absorbs;
-  we will need to either:
-    (a) train separate models per property, or
-    (b) normalize/combine them if the relationship is sufficiently linear.
-  For now we collect both separately and decide in Phase 2.
+  Henry's law search returned only 52 unique ILs. Mole fraction solubility
+  (prop key dNip) covers 216 unique ILs across 518 datasets — much better
+  structural diversity for ML training.
 
-Known ILThermo property keys for CO2 solubility:
-  x2   — mole fraction of CO2 (solubility in liquid phase)
-  lIUh — Henry's law constant (what we already collected)
+  These are related but not identical properties. Henry's law constant KH
+  and mole fraction x2 are connected by KH = P / x2 at infinite dilution,
+  but ILThermo reports them under different experiments at different T/P
+  conditions. We collect them separately and decide in Phase 2 whether to
+  train separate models or convert one to the other.
+
+ILThermo property key:
+  dNip — "Composition at phase equilibrium" (confirmed via ilt.ShowPropertyList())
 
 Input:  nothing (queries ILThermo 2.0 via ILThermoPy)
 Output: data/raw/ilthermo_mole_fraction_raw.csv
@@ -27,8 +29,9 @@ Run from the project root:
 import ilthermopy as ilt
 import pandas as pd
 
-# ILThermo property key for mole fraction of CO2 dissolved in liquid phase
-MOLE_FRACTION_PROP_KEY = "x2"
+# Correct ILThermo key for mole fraction / composition at phase equilibrium
+# Confirmed via ilt.ShowPropertyList() — "x2" is NOT a valid key
+MOLE_FRACTION_PROP_KEY = "dNip"
 CO2_COMPOUND_NAME      = "carbon dioxide"
 CO2_SMILES             = "O=C=O"   # used to detect and drop corrupt rows
 OUTPUT_PATH            = "data/raw/ilthermo_mole_fraction_raw.csv"
@@ -117,8 +120,7 @@ def fetch_mole_fraction_data():
     search_results_df = search_mole_fraction_datasets()
 
     if search_results_df.empty:
-        print("\nERROR: No mole fraction data found. The property key may be wrong.")
-        print("Try browsing https://ilthermo.boulder.nist.gov to confirm the key for x2.")
+        print("\nERROR: No mole fraction data found.")
         return pd.DataFrame()
 
     all_rows = []
@@ -139,8 +141,8 @@ def fetch_mole_fraction_data():
 
     datasets_df.to_csv(OUTPUT_PATH, index=False)
     print(f"\nSaved to: {OUTPUT_PATH}")
-    print("\nDatasets per IL:")
-    print(datasets_df['il_name'].value_counts().to_string())
+    print("\nDatasets per IL (top 20):")
+    print(datasets_df['il_name'].value_counts().head(20).to_string())
 
     return datasets_df
 
