@@ -4,23 +4,22 @@ train_model.py
 PURPOSE: Train a Random Forest and XGBoost regressor to predict log10(CO2 mole
          fraction solubility) from IL molecular features + temperature + pressure.
 
-WHY T_K AND P_MPa ARE NOW INCLUDED AS FEATURES:
-  The first run produced R² ≈ -0.10 (worse than predicting the mean).
-  This happened because structure-only features can't explain row-level variance —
-  the same IL measured at 298K vs 350K has very different x2 values.
-  T_K and P_MPa are strong physical predictors of solubility (Henry's law: x2 ∝ 1/H,
-  H changes with T; x2 ∝ P at fixed T). Adding them is scientifically correct,
-  not a cheat — real screening tools always condition on T and P.
+WHY T_K AND P_kPa ARE INCLUDED AS FEATURES:
+  The first run (structure-only) produced R² ≈ -0.10 (worse than predicting the mean).
+  This happened because the same IL measured at 298K vs 350K has very different x2 values —
+  molecular fingerprints alone cannot explain that variance.
+  T_K and P_kPa are direct physical predictors of solubility (Henry's law: x2 ∝ P/H(T)).
+  Adding them is scientifically correct — real process models always condition on T and P.
 
   For competition framing: "Our model predicts CO2 solubility given the IL structure,
-  temperature, and pressure — mirroring real process conditions."
+  temperature, and pressure — mirroring real industrial process conditions."
 
 WHAT EACH STEP PRODUCES:
   1. Cross-validation results on train set → results/cv_results.csv
-  2. Test set evaluation (RMSE, R², MAE) → results/model_performance.csv
-  3. Predicted vs actual values on test → results/test_predictions.csv
-  4. Feature importances (top 30) → results/feature_importances.csv
-  5. Best model saved → models/forward_model.pkl
+  2. Test set evaluation (RMSE, R², MAE)  → results/model_performance.csv
+  3. Predicted vs actual values on test   → results/test_predictions.csv
+  4. Feature importances (top 30)         → results/feature_importances.csv
+  5. Best model saved                     → models/forward_model.pkl
 
 INPUTS:
   data/processed/train_set.csv   (from build_dataset.py)
@@ -46,10 +45,10 @@ MODEL_DIR   = "models"
 RESULTS_DIR = "results"
 MODEL_PATH  = os.path.join(MODEL_DIR, "forward_model.pkl")
 
-TARGET_COL          = "log_x2_CO2"   # log10-transformed mole fraction solubility
-CONDITION_FEATURES  = ["T_K", "P_MPa"]  # temperature and pressure — physical predictors
-CV_FOLDS            = 5
-RANDOM_SEED         = 42
+TARGET_COL         = "log_x2_CO2"       # log10-transformed mole fraction solubility
+CONDITION_FEATURES = ["T_K", "P_kPa"]   # temperature (K) and pressure (kPa) from ILThermo
+CV_FOLDS           = 5
+RANDOM_SEED        = 42
 
 # Random Forest hyperparameters
 RF_N_ESTIMATORS     = 300
@@ -68,7 +67,7 @@ def load_split(path: str, label: str) -> tuple:
     """
     Load a train or test CSV and build the feature matrix X and target vector y.
 
-    Features = Morgan fingerprint bits (cat_* / an_*) + RDKit descriptors + T_K + P_MPa.
+    Features = Morgan fingerprint bits (cat_* / an_*) + RDKit descriptors + T_K + P_kPa.
     Target   = log10(x2_CO2).
 
     Returns X (numpy array), y (numpy array), il_smiles (Series), feature_cols (list).
@@ -82,13 +81,12 @@ def load_split(path: str, label: str) -> tuple:
     # Molecular structure features (Morgan FP bits + RDKit descriptors)
     molecular_cols = [c for c in df.columns if c.startswith("cat_") or c.startswith("an_")]
 
-    # Check that T_K and P_MPa exist — they must be in the dataset from fetch_datapoints
+    # Verify condition columns exist before proceeding
     missing_conditions = [c for c in CONDITION_FEATURES if c not in df.columns]
     if missing_conditions:
         raise ValueError(
             f"Missing condition columns {missing_conditions} in {path}.\n"
-            f"Available columns include: {list(df.columns[:20])}\n"
-            f"Check column names in your dataset — may be named differently."
+            f"Available columns include: {list(df.columns[:20])}"
         )
 
     feature_cols = molecular_cols + CONDITION_FEATURES  # structure + T + P
@@ -96,6 +94,14 @@ def load_split(path: str, label: str) -> tuple:
           f"+ {len(CONDITION_FEATURES)} condition features = {len(feature_cols)} total")
     print(f"[load_split] {label}: target range "
           f"[{df[TARGET_COL].min():.2f}, {df[TARGET_COL].max():.2f}]")
+
+    # Warn if any condition values are missing — NaN rows would cause silent issues
+    n_missing_t = df["T_K"].isna().sum()
+    n_missing_p = df["P_kPa"].isna().sum()
+    if n_missing_t > 0 or n_missing_p > 0:
+        # DATA QUALITY FLAG: missing T or P means those rows can't be used
+        print(f"[load_split] WARNING: {n_missing_t} rows missing T_K, "
+              f"{n_missing_p} rows missing P_kPa — these will cause NaN predictions")
 
     X         = df[feature_cols].values
     y         = df[TARGET_COL].values
@@ -108,9 +114,9 @@ def cross_validate_model(model, X_train: np.ndarray, y_train: np.ndarray,
     """
     Run 5-fold cross-validation on the training set, reporting mean ± std RMSE and R².
 
-    Plain KFold (not GroupKFold) is appropriate here: CV is for hyperparameter
-    sanity-checking only. The true generalization estimate is the held-out test set,
-    which was already split by IL identity in build_dataset.py.
+    Plain KFold (not GroupKFold) is used here: CV is for hyperparameter sanity-checking.
+    The authoritative generalization estimate is the held-out test set, which was already
+    split by IL identity (no IL overlap) in build_dataset.py.
     """
     kfold = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
 
@@ -140,7 +146,7 @@ def evaluate_on_test(model, X_test: np.ndarray, y_test: np.ndarray,
     Predict on the held-out test set and compute RMSE, R², and MAE.
 
     Reports error in both log10 units (what the model predicts) and mole fraction
-    units (what chemists care about), obtained by back-transforming: x2 = 10^y.
+    units (what chemists care about), via back-transform: x2 = 10^y.
     """
     y_pred = model.predict(X_test)
 
@@ -184,6 +190,7 @@ def get_feature_importances(model, feature_cols: list, model_name: str,
 
     RF uses mean decrease in impurity; XGBoost uses gain.
     Both reflect how much each feature reduces prediction error across all trees.
+    The appearance of T_K / P_kPa near the top is expected and physically meaningful.
     """
     importance_df = pd.DataFrame({
         "feature":    feature_cols,
@@ -204,8 +211,8 @@ def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     # ── Step 1: Load data ───────────────────────────────────────────────────
-    X_train, y_train, _, feature_cols = load_split(TRAIN_CSV, "Train")
-    X_test,  y_test,  il_smiles_test, _ = load_split(TEST_CSV, "Test")
+    X_train, y_train, _, feature_cols       = load_split(TRAIN_CSV, "Train")
+    X_test,  y_test,  il_smiles_test, _     = load_split(TEST_CSV,  "Test")
 
     print(f"\n[main] {X_train.shape[1]} total features | "
           f"{X_train.shape[0]} train rows | {X_test.shape[0]} test rows")
@@ -229,7 +236,7 @@ def main():
         verbosity        = 0,
     )
 
-    # Store as a plain dict — avoids the KeyError from using list of tuples
+    # Dict (not list of tuples) so we can look up model by string name later
     models = {
         "RandomForest": random_forest,
         "XGBoost":      xgboost_model,
@@ -242,8 +249,8 @@ def main():
         cv_result = cross_validate_model(model, X_train, y_train, name)
         cv_results.append(cv_result)
 
-    cv_df = pd.DataFrame(cv_results)
-    cv_df.to_csv(os.path.join(RESULTS_DIR, "cv_results.csv"), index=False)
+    pd.DataFrame(cv_results).to_csv(
+        os.path.join(RESULTS_DIR, "cv_results.csv"), index=False)
     print(f"\n[main] CV results saved → results/cv_results.csv")
 
     # ── Step 4: Fit on full train set, evaluate on test ─────────────────────
@@ -271,13 +278,12 @@ def main():
 
     # ── Step 5: Select and save best model ──────────────────────────────────
     best_idx   = perf_df["test_r2"].idxmax()
-    best_name  = perf_df.loc[best_idx, "model"]    # string name from perf_df
-    best_model = models[best_name]                  # look up in dict by name — fixes KeyError
+    best_name  = perf_df.loc[best_idx, "model"]   # string key into models dict
+    best_model = models[best_name]
+    best_r2    = perf_df.loc[best_idx, "test_r2"]
+    best_rmse  = perf_df.loc[best_idx, "test_rmse_log"]
 
-    best_r2   = perf_df.loc[best_idx, "test_r2"]
-    best_rmse = perf_df.loc[best_idx, "test_rmse_log"]
     print(f"\n[main] Best model: {best_name}  (R² = {best_r2:.4f}, RMSE = {best_rmse:.4f})")
-
     joblib.dump(best_model, MODEL_PATH)
     print(f"[main] Best model saved → {MODEL_PATH}")
 
@@ -299,19 +305,14 @@ def main():
     print("  models/forward_model.pkl")
     print("  models/best_model_name.txt")
 
-    # ── Diagnostics ─────────────────────────────────────────────────────────
-    # DATA QUALITY NOTE: If R² is still < 0.5 after adding T_K/P_MPa:
-    #   - Check that T_K and P_MPa columns are correctly named in the CSV
-    #   - Check that the dataset isn't missing P_MPa for most rows (some ILThermo
-    #     entries don't record pressure; those rows may have NaN → rows silently dropped)
-    #   - Consider adding GroupKFold CV to get a better generalization estimate
-
+    # ── Final diagnostic ─────────────────────────────────────────────────────
+    # DATA QUALITY NOTE: If R² is still < 0.5 after adding T_K/P_kPa, the most
+    # likely causes are: (1) P_kPa is NaN for many rows — check with .describe(),
+    # (2) train/test IL distributions are too dissimilar for structure to generalize.
     if best_r2 < 0.5:
         print(f"\n⚠️  WARNING: Best R² = {best_r2:.4f} — still below 0.5.")
-        print("   Check that T_K and P_MPa are present and not mostly NaN in the CSVs.")
-        print("   Run: python -c \"import pandas as pd; "
-              "df=pd.read_csv('data/processed/train_set.csv'); "
-              "print(df[['T_K','P_MPa']].describe())\"")
+        print("   Check P_kPa coverage: python -c \"import pandas as pd; "
+              "print(pd.read_csv('data/processed/train_set.csv')[['T_K','P_kPa']].describe())\"")
     else:
         print(f"\n✓ Model R² = {best_r2:.4f}. Phase 3 complete.")
         print("  Ready for src/plot_results.py (figures) or Phase 4 inverse design.")
