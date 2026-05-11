@@ -1,10 +1,19 @@
 """
 train_model.py
 --------------
-PURPOSE: Train a Random Forest and XGBoost regressor on the ML-ready dataset
-         to predict log10(CO2 mole fraction solubility) from IL Morgan fingerprints
-         and RDKit descriptors. Evaluates with 5-fold cross-validation on train set
-         and final RMSE/R² on the held-out test set.
+PURPOSE: Train a Random Forest and XGBoost regressor to predict log10(CO2 mole
+         fraction solubility) from IL molecular features + temperature + pressure.
+
+WHY T_K AND P_MPa ARE NOW INCLUDED AS FEATURES:
+  The first run produced R² ≈ -0.10 (worse than predicting the mean).
+  This happened because structure-only features can't explain row-level variance —
+  the same IL measured at 298K vs 350K has very different x2 values.
+  T_K and P_MPa are strong physical predictors of solubility (Henry's law: x2 ∝ 1/H,
+  H changes with T; x2 ∝ P at fixed T). Adding them is scientifically correct,
+  not a cheat — real screening tools always condition on T and P.
+
+  For competition framing: "Our model predicts CO2 solubility given the IL structure,
+  temperature, and pressure — mirroring real process conditions."
 
 WHAT EACH STEP PRODUCES:
   1. Cross-validation results on train set → results/cv_results.csv
@@ -31,38 +40,38 @@ from sklearn.model_selection import cross_val_score, KFold
 from xgboost import XGBRegressor
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-TRAIN_CSV     = os.path.join("data", "processed", "train_set.csv")
-TEST_CSV      = os.path.join("data", "processed", "test_set.csv")
-MODEL_DIR     = "models"
-RESULTS_DIR   = "results"
-MODEL_PATH    = os.path.join(MODEL_DIR, "forward_model.pkl")
+TRAIN_CSV   = os.path.join("data", "processed", "train_set.csv")
+TEST_CSV    = os.path.join("data", "processed", "test_set.csv")
+MODEL_DIR   = "models"
+RESULTS_DIR = "results"
+MODEL_PATH  = os.path.join(MODEL_DIR, "forward_model.pkl")
 
-TARGET_COL    = "log_x2_CO2"    # what we're predicting
-CV_FOLDS      = 5               # number of cross-validation folds
-RANDOM_SEED   = 42              # for reproducibility
+TARGET_COL          = "log_x2_CO2"   # log10-transformed mole fraction solubility
+CONDITION_FEATURES  = ["T_K", "P_MPa"]  # temperature and pressure — physical predictors
+CV_FOLDS            = 5
+RANDOM_SEED         = 42
 
-# Random Forest hyperparameters — reasonable defaults for ~7,000 training rows
-RF_N_ESTIMATORS  = 300         # more trees = more stable, diminishing returns after ~300
-RF_MAX_FEATURES  = "sqrt"      # sqrt(4112) ≈ 64 features per split (standard for RF)
-RF_MIN_SAMPLES_LEAF = 3        # avoids overfitting on sparse IL clusters
+# Random Forest hyperparameters
+RF_N_ESTIMATORS     = 300
+RF_MAX_FEATURES     = "sqrt"   # sqrt(n_features) per split — standard for RF
+RF_MIN_SAMPLES_LEAF = 3        # prevents overfitting on sparse IL clusters
 
-# XGBoost hyperparameters — conservative settings to avoid overfitting
-XGB_N_ESTIMATORS   = 500
-XGB_LEARNING_RATE  = 0.05      # small LR with many trees generalizes better
-XGB_MAX_DEPTH      = 6         # standard depth; deeper risks overfitting
-XGB_SUBSAMPLE      = 0.8       # row subsampling adds regularization
-XGB_COLSAMPLE      = 0.8       # feature subsampling per tree
+# XGBoost hyperparameters
+XGB_N_ESTIMATORS    = 500
+XGB_LEARNING_RATE   = 0.05
+XGB_MAX_DEPTH       = 6
+XGB_SUBSAMPLE       = 0.8
+XGB_COLSAMPLE       = 0.8
 
 
-def load_split(path: str, label: str) -> tuple[np.ndarray, np.ndarray, pd.Series]:
+def load_split(path: str, label: str) -> tuple:
     """
-    Load a train or test CSV and separate features (cat_* / an_* columns)
-    from the target column.
+    Load a train or test CSV and build the feature matrix X and target vector y.
 
-    Returns:
-        X       — feature matrix as numpy array
-        y       — target vector (log10 x2_CO2) as numpy array
-        il_smiles — IL identity column (kept for error analysis)
+    Features = Morgan fingerprint bits (cat_* / an_*) + RDKit descriptors + T_K + P_MPa.
+    Target   = log10(x2_CO2).
+
+    Returns X (numpy array), y (numpy array), il_smiles (Series), feature_cols (list).
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"{label} not found at {path}. Run build_dataset.py first.")
@@ -70,11 +79,23 @@ def load_split(path: str, label: str) -> tuple[np.ndarray, np.ndarray, pd.Series
     df = pd.read_csv(path)
     print(f"[load_split] {label}: {df.shape[0]} rows × {df.shape[1]} cols")
 
-    # Feature columns: all Morgan fingerprint bits and RDKit descriptors
-    # They are prefixed cat_ (cation features) or an_ (anion features)
-    feature_cols = [c for c in df.columns if c.startswith("cat_") or c.startswith("an_")]
-    print(f"[load_split] {label}: {len(feature_cols)} features, "
-          f"target range [{df[TARGET_COL].min():.2f}, {df[TARGET_COL].max():.2f}]")
+    # Molecular structure features (Morgan FP bits + RDKit descriptors)
+    molecular_cols = [c for c in df.columns if c.startswith("cat_") or c.startswith("an_")]
+
+    # Check that T_K and P_MPa exist — they must be in the dataset from fetch_datapoints
+    missing_conditions = [c for c in CONDITION_FEATURES if c not in df.columns]
+    if missing_conditions:
+        raise ValueError(
+            f"Missing condition columns {missing_conditions} in {path}.\n"
+            f"Available columns include: {list(df.columns[:20])}\n"
+            f"Check column names in your dataset — may be named differently."
+        )
+
+    feature_cols = molecular_cols + CONDITION_FEATURES  # structure + T + P
+    print(f"[load_split] {label}: {len(molecular_cols)} molecular features "
+          f"+ {len(CONDITION_FEATURES)} condition features = {len(feature_cols)} total")
+    print(f"[load_split] {label}: target range "
+          f"[{df[TARGET_COL].min():.2f}, {df[TARGET_COL].max():.2f}]")
 
     X         = df[feature_cols].values
     y         = df[TARGET_COL].values
@@ -85,19 +106,17 @@ def load_split(path: str, label: str) -> tuple[np.ndarray, np.ndarray, pd.Series
 def cross_validate_model(model, X_train: np.ndarray, y_train: np.ndarray,
                          model_name: str) -> dict:
     """
-    Run 5-fold cross-validation on the training set and report mean ± std RMSE and R².
+    Run 5-fold cross-validation on the training set, reporting mean ± std RMSE and R².
 
-    NOTE: We use plain KFold here (not GroupKFold) because the GroupShuffleSplit
-    in build_dataset.py already guarantees the test set has no IL overlap.
-    Cross-val is for hyperparameter sanity-checking, not final evaluation.
-    Final unbiased performance comes from the held-out test set.
+    Plain KFold (not GroupKFold) is appropriate here: CV is for hyperparameter
+    sanity-checking only. The true generalization estimate is the held-out test set,
+    which was already split by IL identity in build_dataset.py.
     """
     kfold = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
 
-    # neg_root_mean_squared_error returns negative RMSE — sklearn convention
     rmse_scores = -cross_val_score(model, X_train, y_train,
                                    cv=kfold, scoring="neg_root_mean_squared_error",
-                                   n_jobs=-1)  # use all CPU cores
+                                   n_jobs=-1)
     r2_scores   =  cross_val_score(model, X_train, y_train,
                                    cv=kfold, scoring="r2",
                                    n_jobs=-1)
@@ -107,7 +126,7 @@ def cross_validate_model(model, X_train: np.ndarray, y_train: np.ndarray,
     print(f"  CV R²              : {r2_scores.mean():.4f} ± {r2_scores.std():.4f}")
 
     return {
-        "model":       model_name,
+        "model":        model_name,
         "cv_rmse_mean": rmse_scores.mean(),
         "cv_rmse_std":  rmse_scores.std(),
         "cv_r2_mean":   r2_scores.mean(),
@@ -116,15 +135,12 @@ def cross_validate_model(model, X_train: np.ndarray, y_train: np.ndarray,
 
 
 def evaluate_on_test(model, X_test: np.ndarray, y_test: np.ndarray,
-                     il_smiles_test: pd.Series, model_name: str) -> tuple[dict, pd.DataFrame]:
+                     il_smiles_test: pd.Series, model_name: str) -> tuple:
     """
-    Fit the model on the full training set (already done upstream), then
-    evaluate RMSE, R², and MAE on the completely held-out test set.
+    Predict on the held-out test set and compute RMSE, R², and MAE.
 
-    Also computes back-transformed error: we predicted log10(x2), so
-    actual prediction error in mole fraction units = 10^y_pred vs 10^y_true.
-
-    Returns the performance dict and a DataFrame of per-row predictions.
+    Reports error in both log10 units (what the model predicts) and mole fraction
+    units (what chemists care about), obtained by back-transforming: x2 = 10^y.
     """
     y_pred = model.predict(X_test)
 
@@ -132,8 +148,7 @@ def evaluate_on_test(model, X_test: np.ndarray, y_test: np.ndarray,
     r2   = r2_score(y_test, y_pred)
     mae  = mean_absolute_error(y_test, y_pred)
 
-    # Convert log10 predictions back to mole fraction for interpretability
-    x2_true = 10 ** y_test
+    x2_true = 10 ** y_test    # back-transform from log10 to mole fraction
     x2_pred = 10 ** y_pred
     x2_rmse = np.sqrt(mean_squared_error(x2_true, x2_pred))
 
@@ -143,12 +158,11 @@ def evaluate_on_test(model, X_test: np.ndarray, y_test: np.ndarray,
     print(f"  MAE   (log10 x2) : {mae:.4f}")
     print(f"  RMSE  (x2 units) : {x2_rmse:.6f}   ← mole fraction error")
 
-    # Per-row predictions table for plotting and error analysis
     predictions_df = pd.DataFrame({
         "il_smiles":    il_smiles_test.values,
         "y_true_log":   y_test,
         "y_pred_log":   y_pred,
-        "residual_log": y_pred - y_test,    # positive = overpredicted
+        "residual_log": y_pred - y_test,   # positive = model overpredicted
         "x2_true":      x2_true,
         "x2_pred":      x2_pred,
     })
@@ -166,17 +180,14 @@ def evaluate_on_test(model, X_test: np.ndarray, y_test: np.ndarray,
 def get_feature_importances(model, feature_cols: list, model_name: str,
                             top_n: int = 30) -> pd.DataFrame:
     """
-    Extract feature importances from a fitted tree-based model and return
-    the top N most important features sorted descending.
+    Extract and rank feature importances from a fitted tree-based model.
 
-    For Random Forest: mean decrease in impurity.
-    For XGBoost: gain-based importance.
-    Both measure how much each feature reduces prediction error across all trees.
+    RF uses mean decrease in impurity; XGBoost uses gain.
+    Both reflect how much each feature reduces prediction error across all trees.
     """
-    importances = model.feature_importances_
     importance_df = pd.DataFrame({
         "feature":    feature_cols,
-        "importance": importances,
+        "importance": model.feature_importances_,
         "model":      model_name,
     }).sort_values("importance", ascending=False).reset_index(drop=True)
 
@@ -187,23 +198,17 @@ def get_feature_importances(model, feature_cols: list, model_name: str,
 
 def main():
     """
-    Main pipeline:
-      1. Load train/test splits
-      2. Cross-validate RF and XGBoost on training set
-      3. Fit best model on full training set
-      4. Evaluate on held-out test set
-      5. Extract feature importances
-      6. Save model + all result CSVs
+    Main pipeline: load → cross-validate → fit → test evaluation → save.
     """
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     # ── Step 1: Load data ───────────────────────────────────────────────────
     X_train, y_train, _, feature_cols = load_split(TRAIN_CSV, "Train")
-    X_test,  y_test,  il_smiles_test, _ = load_split(TEST_CSV,  "Test")
+    X_test,  y_test,  il_smiles_test, _ = load_split(TEST_CSV, "Test")
 
-    print(f"\n[main] Feature matrix: {X_train.shape[1]} features, "
-          f"{X_train.shape[0]} train rows, {X_test.shape[0]} test rows")
+    print(f"\n[main] {X_train.shape[1]} total features | "
+          f"{X_train.shape[0]} train rows | {X_test.shape[0]} test rows")
 
     # ── Step 2: Define models ───────────────────────────────────────────────
     random_forest = RandomForestRegressor(
@@ -211,29 +216,29 @@ def main():
         max_features     = RF_MAX_FEATURES,
         min_samples_leaf = RF_MIN_SAMPLES_LEAF,
         random_state     = RANDOM_SEED,
-        n_jobs           = -1,    # use all CPU cores
+        n_jobs           = -1,
     )
-
     xgboost_model = XGBRegressor(
-        n_estimators    = XGB_N_ESTIMATORS,
-        learning_rate   = XGB_LEARNING_RATE,
-        max_depth       = XGB_MAX_DEPTH,
-        subsample       = XGB_SUBSAMPLE,
-        colsample_bytree= XGB_COLSAMPLE,
-        random_state    = RANDOM_SEED,
-        n_jobs          = -1,
-        verbosity       = 0,   # suppress XGBoost internal logging
+        n_estimators     = XGB_N_ESTIMATORS,
+        learning_rate    = XGB_LEARNING_RATE,
+        max_depth        = XGB_MAX_DEPTH,
+        subsample        = XGB_SUBSAMPLE,
+        colsample_bytree = XGB_COLSAMPLE,
+        random_state     = RANDOM_SEED,
+        n_jobs           = -1,
+        verbosity        = 0,
     )
 
-    models = [
-        (random_forest,  "RandomForest"),
-        (xgboost_model,  "XGBoost"),
-    ]
+    # Store as a plain dict — avoids the KeyError from using list of tuples
+    models = {
+        "RandomForest": random_forest,
+        "XGBoost":      xgboost_model,
+    }
 
     # ── Step 3: Cross-validate on training set ──────────────────────────────
     print("\n=== CROSS-VALIDATION (train set, 5-fold) ===")
     cv_results = []
-    for model, name in models:
+    for name, model in models.items():
         cv_result = cross_validate_model(model, X_train, y_train, name)
         cv_results.append(cv_result)
 
@@ -241,21 +246,20 @@ def main():
     cv_df.to_csv(os.path.join(RESULTS_DIR, "cv_results.csv"), index=False)
     print(f"\n[main] CV results saved → results/cv_results.csv")
 
-    # ── Step 4: Fit both models on full train set, evaluate on test ─────────
+    # ── Step 4: Fit on full train set, evaluate on test ─────────────────────
     print("\n=== TEST SET EVALUATION ===")
     test_performances = []
     all_predictions   = []
     all_importances   = []
 
-    for model, name in models:
+    for name, model in models.items():
         print(f"\n[main] Fitting {name} on full training set…")
-        model.fit(X_train, y_train)   # fit on ALL training rows (not CV fold)
+        model.fit(X_train, y_train)
 
-        perf, predictions_df = evaluate_on_test(
-            model, X_test, y_test, il_smiles_test, name)
+        perf, predictions_df = evaluate_on_test(model, X_test, y_test, il_smiles_test, name)
         test_performances.append(perf)
 
-        predictions_df["model"] = name  # tag rows with model name
+        predictions_df["model"] = name
         all_predictions.append(predictions_df)
 
         imp_df = get_feature_importances(model, feature_cols, name, top_n=30)
@@ -265,29 +269,27 @@ def main():
     print("\n=== FINAL PERFORMANCE COMPARISON ===")
     print(perf_df.to_string(index=False))
 
-    # ── Step 5: Select best model by test R² ────────────────────────────────
-    best_row   = perf_df.loc[perf_df["test_r2"].idxmax()]
-    best_name  = best_row["model"]
-    best_model = dict(models)[best_name]
+    # ── Step 5: Select and save best model ──────────────────────────────────
+    best_idx   = perf_df["test_r2"].idxmax()
+    best_name  = perf_df.loc[best_idx, "model"]    # string name from perf_df
+    best_model = models[best_name]                  # look up in dict by name — fixes KeyError
 
-    print(f"\n[main] Best model: {best_name}  "
-          f"(R² = {best_row['test_r2']:.4f}, RMSE = {best_row['test_rmse_log']:.4f})")
+    best_r2   = perf_df.loc[best_idx, "test_r2"]
+    best_rmse = perf_df.loc[best_idx, "test_rmse_log"]
+    print(f"\n[main] Best model: {best_name}  (R² = {best_r2:.4f}, RMSE = {best_rmse:.4f})")
 
-    # ── Step 6: Save everything ─────────────────────────────────────────────
     joblib.dump(best_model, MODEL_PATH)
     print(f"[main] Best model saved → {MODEL_PATH}")
 
-    # Save a label so downstream scripts know which model was selected
     with open(os.path.join(MODEL_DIR, "best_model_name.txt"), "w") as f:
         f.write(best_name)
 
+    # ── Step 6: Save all result tables ──────────────────────────────────────
     perf_df.to_csv(os.path.join(RESULTS_DIR, "model_performance.csv"), index=False)
-
-    all_preds_df = pd.concat(all_predictions, ignore_index=True)
-    all_preds_df.to_csv(os.path.join(RESULTS_DIR, "test_predictions.csv"), index=False)
-
-    all_imps_df = pd.concat(all_importances, ignore_index=True)
-    all_imps_df.to_csv(os.path.join(RESULTS_DIR, "feature_importances.csv"), index=False)
+    pd.concat(all_predictions, ignore_index=True).to_csv(
+        os.path.join(RESULTS_DIR, "test_predictions.csv"), index=False)
+    pd.concat(all_importances, ignore_index=True).to_csv(
+        os.path.join(RESULTS_DIR, "feature_importances.csv"), index=False)
 
     print("\n[main] All results saved:")
     print("  results/cv_results.csv")
@@ -297,19 +299,22 @@ def main():
     print("  models/forward_model.pkl")
     print("  models/best_model_name.txt")
 
-    # ── Limitation note for paper ────────────────────────────────────────────
-    # DATA QUALITY NOTE: If R² < 0.6 on the test set, the most likely causes are:
-    #   1. Too few unique ILs (211 is borderline for generalization)
-    #   2. Morgan fingerprints don't capture conformational or ionic effects
-    #   3. T/P variation in the dataset adds noise not captured by structure alone
-    # In that case: (a) add T_K and P_MPa as explicit features, (b) expand dataset.
+    # ── Diagnostics ─────────────────────────────────────────────────────────
+    # DATA QUALITY NOTE: If R² is still < 0.5 after adding T_K/P_MPa:
+    #   - Check that T_K and P_MPa columns are correctly named in the CSV
+    #   - Check that the dataset isn't missing P_MPa for most rows (some ILThermo
+    #     entries don't record pressure; those rows may have NaN → rows silently dropped)
+    #   - Consider adding GroupKFold CV to get a better generalization estimate
 
-    if min(r["test_r2"] for r in test_performances) < 0.6:
-        print("\n⚠️  WARNING: Best R² < 0.6 — consider adding T_K/P_MPa as features "
-              "or expanding dataset. See limitation note in code.")
-
-    print("\n[main] Phase 3 complete. Ready for src/plot_results.py (figures) "
-          "or Phase 4 inverse design.")
+    if best_r2 < 0.5:
+        print(f"\n⚠️  WARNING: Best R² = {best_r2:.4f} — still below 0.5.")
+        print("   Check that T_K and P_MPa are present and not mostly NaN in the CSVs.")
+        print("   Run: python -c \"import pandas as pd; "
+              "df=pd.read_csv('data/processed/train_set.csv'); "
+              "print(df[['T_K','P_MPa']].describe())\"")
+    else:
+        print(f"\n✓ Model R² = {best_r2:.4f}. Phase 3 complete.")
+        print("  Ready for src/plot_results.py (figures) or Phase 4 inverse design.")
 
 
 if __name__ == "__main__":
