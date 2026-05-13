@@ -56,24 +56,41 @@ COLOR_BAR   = "#2563EB"   # blue -- bar chart
 COLOR_PIE   = [           # distinct colors for anion family bar chart
     "#2563EB", "#DC2626", "#16A34A", "#D97706",
     "#7C3AED", "#DB2777", "#0891B2", "#65A30D",
+    "#92400E", "#065F46",
 ]
 
 # Anion family classification: maps SMILES substrings to readable family names.
 # Order matters -- more specific patterns first to avoid false matches.
+# Patterns verified against actual virtual library anion SMILES from inverse_design.py output.
+# Virtual library uses 'O=S(=O)(...)' format (explicit O= prefix on sulfonyl groups).
 ANION_FAMILY_PATTERNS = [
-    ("S(=O)(=O)([N-]S(=O)(=O)C(F)(F)F)",  "[Tf2N]-"),
-    ("S(=O)(=O)([N-]S(=O)(=O)F)",          "[FSI]-"),
-    ("S(=O)(=O)([O-])C(F)(F)F",            "[OTf]-"),
-    ("F[B-](F)(F)F",                        "[BF4]-"),
-    ("F[P-](F)(F)(F)(F)F",                  "[PF6]-"),
-    ("N(=O)[N-]C#N",                        "[DCA]-"),
-    ("[B-](C#N)",                           "[TCB]-"),
-    ("C(=O)[O-]",                           "Carboxylate"),
-    ("S(=O)(=O)([O-])",                     "Sulfonate"),
-    ("[Cl-]",                               "[Cl]-"),
-    ("[Br-]",                               "[Br]-"),
-    ("[I-]",                                "[I]-"),
-    ("[F-]",                                "[F]-"),
+    # Bis(trifluoromethylsulfonyl)imide [Tf2N]- -- most specific, check first
+    ("S(=O)(=O)C(F)(F)F",          "[Tf2N]-"),      # matches O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F
+    # Bis(fluorosulfonyl)imide [FSI]-
+    ("[N-](S(=O)(=O)F)S(=O)(=O)F", "[FSI]-"),
+    # Fluorosulfonyl-nitrile [SFN]- / FSIN-
+    ("[N-](S(=O)(=O)F)C#N",        "[SFN]-"),
+    # Trifluoromethanesulfonate [OTf]-
+    ("S(=O)(=O)([O-])C(F)(F)F",    "[OTf]-"),
+    # Tetracyanoborate [TCB]-
+    ("[B-](C#N)(C#N)(C#N)C#N",     "[TCB]-"),
+    # Dicyanamide [DCA]-
+    ("[N-](C#N)C#N",               "[DCA]-"),
+    # Tetrafluoroborate [BF4]-
+    ("[B-](F)(F)(F)F",             "[BF4]-"),
+    # Hexafluorophosphate [PF6]-
+    ("[P-](F)(F)(F)(F)(F)F",       "[PF6]-"),
+    # Benzenesulfonate
+    ("S(=O)(=O)([O-])c1ccccc1",    "Sulfonate"),
+    # Alkylsulfonate (catch-all for other sulfonates)
+    ("S(=O)(=O)[O-]",              "Sulfonate"),
+    # Carboxylate / trifluoroacetate
+    ("C(=O)[O-]",                  "Carboxylate"),
+    # Halides
+    ("[Cl-]",  "[Cl]-"),
+    ("[Br-]",  "[Br]-"),
+    ("[I-]",   "[I]-"),
+    ("[F-]",   "[F]-"),
 ]
 
 
@@ -103,11 +120,14 @@ def classify_anion_family(anion_smiles: str) -> str:
     """
     Map an anion SMILES string to a human-readable anion family name.
     Uses substring matching against ANION_FAMILY_PATTERNS (most specific first).
-    Returns 'Other' if no pattern matches.
+    Returns 'Other' if no pattern matches -- if this appears in output,
+    add the unmatched SMILES to ANION_FAMILY_PATTERNS above.
     """
     for pattern, family_name in ANION_FAMILY_PATTERNS:
         if pattern in anion_smiles:
             return family_name
+    # DATA QUALITY FLAG: unclassified anion -- print for debugging
+    print(f"  [NOTE] Unclassified anion SMILES: {anion_smiles}")
     return "Other"
 
 
@@ -120,8 +140,10 @@ def plot_virtual_library_scatter(all_preds_df: pd.DataFrame,
     For judges: 'We screened N virtual ILs; our top candidates cluster at
     the high-absorption end of the distribution.'
     """
-    all_log_x2 = all_preds_df["log_x2_predicted"].values
-    all_ranks   = np.arange(1, len(all_log_x2) + 1)
+    # Sort all predictions by x2 descending so rank 1 = best (leftmost on x-axis)
+    sorted_preds = all_preds_df.sort_values("x2_predicted", ascending=False).reset_index(drop=True)
+    all_log_x2   = sorted_preds["log_x2_predicted"].values
+    all_ranks     = np.arange(1, len(all_log_x2) + 1)
 
     # Top candidates by their rank column from inverse_design.py
     top_ranks  = top_cands_df["rank"].values
@@ -202,9 +224,11 @@ def plot_anion_family_distribution(top_cands_df: pd.DataFrame) -> None:
     anion_families = top_cands_df["anion_smiles"].apply(classify_anion_family)
     family_counts   = anion_families.value_counts()
 
+    print(f"  Anion family breakdown: {dict(family_counts)}")
+
     colors_used = COLOR_PIE[:len(family_counts)]
 
-    fig, ax = plt.subplots(figsize=(7, 4))
+    fig, ax = plt.subplots(figsize=(8, 4))
 
     ax.bar(family_counts.index, family_counts.values,
            color=colors_used, edgecolor="white", linewidth=0.5)
