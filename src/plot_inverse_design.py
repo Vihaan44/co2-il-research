@@ -59,40 +59,42 @@ COLOR_PIE   = [           # distinct colors for anion family bar chart
     "#92400E", "#065F46",
 ]
 
-# Anion family classification: substring patterns verified against actual
-# virtual library anion SMILES printed by inverse_design.py.
-# Order: most specific first to avoid false matches (e.g. [Tf2N] before generic sulfonate).
+# Anion family classification rules.
+# Each entry is (list_of_substrings_ANY_must_match, family_name).
+# Using multiple substrings per family handles different SMILES atom orderings
+# for the same chemical group (e.g. '[O-]C(=O)' vs 'C(=O)[O-]').
+# Order: most specific families first to avoid false matches.
 ANION_FAMILY_PATTERNS = [
-    # [Tf2N]-: bis(trifluoromethylsulfonyl)imide -- C(F)(F)F on sulfonyl is unique
-    ("S(=O)(=O)C(F)(F)F",          "[Tf2N]-"),
-    # [FSI]-: bis(fluorosulfonyl)imide -- two S(=O)(=O)F groups on N
-    ("S(=O)(=O)F)F",               "[FSI]-"),    # matches O=S(=O)([N-]S(=O)(=O)F)F
+    # [Tf2N]-: bis(trifluoromethylsulfonyl)imide -- CF3 on sulfonyl is unique
+    (["S(=O)(=O)C(F)(F)F"],                          "[Tf2N]-"),
+    # [FSI]-: bis(fluorosulfonyl)imide
+    (["S(=O)(=O)F)F", "S(=O)(=O)F)S"],               "[FSI]-"),
     # [SFN]-: fluorosulfonyl-nitrile
-    ("[N-](S(=O)(=O)F)C#N",        "[SFN]-"),
-    # [OTf]-: trifluoromethanesulfonate -- S(=O)(=O)[O-] with CF3
-    ("S(=O)(=O)([O-])C(F)(F)F",    "[OTf]-"),    # O=S(=O)([O-])C(F)(F)F
-    # Trifluoroacetate -- CF3 on carboxylate
-    ("C(=O)[O-]",                  "Carboxylate"),   # catches [O-]C(=O)C(F)(F)F and plain carboxylates
+    (["[N-](S(=O)(=O)F)C#N"],                        "[SFN]-"),
+    # [OTf]-: trifluoromethanesulfonate -- S(=O)(=O) with CF3 and O-
+    (["S(=O)(=O)([O-])C(F)(F)F", "S(=O)([O-])C(F)(F)F",
+      "([O-])C(F)(F)F"],                              "[OTf]-"),
     # [TCB]-: tetracyanoborate
-    ("[B-](C#N)(C#N)(C#N)C#N",     "[TCB]-"),
+    (["[B-](C#N)(C#N)(C#N)C#N"],                     "[TCB]-"),
     # [DCA]-: dicyanamide
-    ("[N-](C#N)C#N",               "[DCA]-"),
+    (["[N-](C#N)C#N"],                               "[DCA]-"),
     # [BF4]-: tetrafluoroborate
-    ("[B-](F)(F)(F)F",             "[BF4]-"),
-    # [PF6]-: hexafluorophosphate -- F[P-] or [P-](F)
-    ("[P-](F)",                    "[PF6]-"),        # matches F[P-](F)(F)(F)(F)F
-    # Benzenesulfonate (aromatic ring on sulfonate)
-    ("S(=O)(=O)([O-])c1ccccc1",    "Arylsulfonate"),
-    # Alkylsulfate: S([O-])(=O)=O pattern (no N, no F, aliphatic)
-    ("OS([O-])(=O)=O",             "Alkylsulfate"),  # CCCCOS([O-])(=O)=O
-    ("S([O-])(=O)=O",              "Alkylsulfate"),  # CS([O-])(=O)=O (mesylate)
-    # Generic sulfonate catch-all (after specific ones above)
-    ("S(=O)(=O)[O-]",              "Sulfonate"),
+    (["[B-](F)(F)(F)F"],                             "[BF4]-"),
+    # [PF6]-: hexafluorophosphate
+    (["[P-](F)", "F[P-]"],                           "[PF6]-"),
+    # Arylsulfonate: sulfonate with aromatic ring
+    (["S(=O)(=O)([O-])c", "([O-])S(=O)(=O)c",
+      "S(=O)([O-])c", "c1ccccc1"],                   "Arylsulfonate"),
+    # Alkylsulfate: S-O-C (ester linkage) with O-
+    (["OS([O-])(=O)=O", "S([O-])(=O)=O",
+      "S(=O)(=O)[O-]"],                              "Alkylsulfate"),
+    # Carboxylate / trifluoroacetate: C=O with O-
+    (["C(=O)[O-]", "[O-]C(=O)"],                    "Carboxylate"),
     # Halides
-    ("[Cl-]",  "[Cl]-"),
-    ("[Br-]",  "[Br]-"),
-    ("[I-]",   "[I]-"),
-    ("[F-]",   "[F]-"),
+    (["[Cl-]"],  "[Cl]-"),
+    (["[Br-]"],  "[Br]-"),
+    (["[I-]"],   "[I]-"),
+    (["[F-]"],   "[F]-"),
 ]
 
 
@@ -121,13 +123,14 @@ def load_results() -> tuple:
 def classify_anion_family(anion_smiles: str) -> str:
     """
     Map an anion SMILES string to a human-readable anion family name.
-    Uses substring matching against ANION_FAMILY_PATTERNS (most specific first).
-    Returns 'Other' and prints the SMILES if unmatched -- add it to the patterns above.
+    Each family has a list of substrings -- if ANY matches, the family is assigned.
+    This handles different SMILES atom orderings for the same chemical group.
+    Returns 'Other' and prints the SMILES if nothing matches.
     """
-    for pattern, family_name in ANION_FAMILY_PATTERNS:
-        if pattern in anion_smiles:
+    for substrings, family_name in ANION_FAMILY_PATTERNS:
+        if any(sub in anion_smiles for sub in substrings):
             return family_name
-    # DATA QUALITY FLAG: unclassified -- add pattern to ANION_FAMILY_PATTERNS
+    # DATA QUALITY FLAG: unclassified -- add to ANION_FAMILY_PATTERNS above
     print(f"  [NOTE] Unclassified anion SMILES: {anion_smiles}")
     return "Other"
 
@@ -213,8 +216,9 @@ def plot_anion_family_distribution(top_cands_df: pd.DataFrame) -> None:
     Bar chart of anion family frequency among the top candidates.
 
     Answers the judge question: 'What structural features distinguish your
-    top candidates?' Fluorinated anions dominating ([Tf2N]-, [FSI]-) aligns
-    with literature -- fluorine increases CO2 affinity via van der Waals.
+    top candidates?' [Tf2N]- dominating aligns with literature --
+    fluorinated sulfonylimide anions enhance CO2 solubility via van der Waals
+    interactions between CO2 and the fluorine atoms.
     """
     anion_families = top_cands_df["anion_smiles"].apply(classify_anion_family)
     family_counts   = anion_families.value_counts()
