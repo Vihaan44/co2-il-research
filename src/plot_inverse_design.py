@@ -59,33 +59,35 @@ COLOR_PIE   = [           # distinct colors for anion family bar chart
     "#92400E", "#065F46",
 ]
 
-# Anion family classification: maps SMILES substrings to readable family names.
-# Order matters -- more specific patterns first to avoid false matches.
-# Patterns verified against actual virtual library anion SMILES from inverse_design.py output.
-# Virtual library uses 'O=S(=O)(...)' format (explicit O= prefix on sulfonyl groups).
+# Anion family classification: substring patterns verified against actual
+# virtual library anion SMILES printed by inverse_design.py.
+# Order: most specific first to avoid false matches (e.g. [Tf2N] before generic sulfonate).
 ANION_FAMILY_PATTERNS = [
-    # Bis(trifluoromethylsulfonyl)imide [Tf2N]- -- most specific, check first
-    ("S(=O)(=O)C(F)(F)F",          "[Tf2N]-"),      # matches O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F
-    # Bis(fluorosulfonyl)imide [FSI]-
-    ("[N-](S(=O)(=O)F)S(=O)(=O)F", "[FSI]-"),
-    # Fluorosulfonyl-nitrile [SFN]- / FSIN-
+    # [Tf2N]-: bis(trifluoromethylsulfonyl)imide -- C(F)(F)F on sulfonyl is unique
+    ("S(=O)(=O)C(F)(F)F",          "[Tf2N]-"),
+    # [FSI]-: bis(fluorosulfonyl)imide -- two S(=O)(=O)F groups on N
+    ("S(=O)(=O)F)F",               "[FSI]-"),    # matches O=S(=O)([N-]S(=O)(=O)F)F
+    # [SFN]-: fluorosulfonyl-nitrile
     ("[N-](S(=O)(=O)F)C#N",        "[SFN]-"),
-    # Trifluoromethanesulfonate [OTf]-
-    ("S(=O)(=O)([O-])C(F)(F)F",    "[OTf]-"),
-    # Tetracyanoborate [TCB]-
+    # [OTf]-: trifluoromethanesulfonate -- S(=O)(=O)[O-] with CF3
+    ("S(=O)(=O)([O-])C(F)(F)F",    "[OTf]-"),    # O=S(=O)([O-])C(F)(F)F
+    # Trifluoroacetate -- CF3 on carboxylate
+    ("C(=O)[O-]",                  "Carboxylate"),   # catches [O-]C(=O)C(F)(F)F and plain carboxylates
+    # [TCB]-: tetracyanoborate
     ("[B-](C#N)(C#N)(C#N)C#N",     "[TCB]-"),
-    # Dicyanamide [DCA]-
+    # [DCA]-: dicyanamide
     ("[N-](C#N)C#N",               "[DCA]-"),
-    # Tetrafluoroborate [BF4]-
+    # [BF4]-: tetrafluoroborate
     ("[B-](F)(F)(F)F",             "[BF4]-"),
-    # Hexafluorophosphate [PF6]-
-    ("[P-](F)(F)(F)(F)(F)F",       "[PF6]-"),
-    # Benzenesulfonate
-    ("S(=O)(=O)([O-])c1ccccc1",    "Sulfonate"),
-    # Alkylsulfonate (catch-all for other sulfonates)
+    # [PF6]-: hexafluorophosphate -- F[P-] or [P-](F)
+    ("[P-](F)",                    "[PF6]-"),        # matches F[P-](F)(F)(F)(F)F
+    # Benzenesulfonate (aromatic ring on sulfonate)
+    ("S(=O)(=O)([O-])c1ccccc1",    "Arylsulfonate"),
+    # Alkylsulfate: S([O-])(=O)=O pattern (no N, no F, aliphatic)
+    ("OS([O-])(=O)=O",             "Alkylsulfate"),  # CCCCOS([O-])(=O)=O
+    ("S([O-])(=O)=O",              "Alkylsulfate"),  # CS([O-])(=O)=O (mesylate)
+    # Generic sulfonate catch-all (after specific ones above)
     ("S(=O)(=O)[O-]",              "Sulfonate"),
-    # Carboxylate / trifluoroacetate
-    ("C(=O)[O-]",                  "Carboxylate"),
     # Halides
     ("[Cl-]",  "[Cl]-"),
     ("[Br-]",  "[Br]-"),
@@ -120,13 +122,12 @@ def classify_anion_family(anion_smiles: str) -> str:
     """
     Map an anion SMILES string to a human-readable anion family name.
     Uses substring matching against ANION_FAMILY_PATTERNS (most specific first).
-    Returns 'Other' if no pattern matches -- if this appears in output,
-    add the unmatched SMILES to ANION_FAMILY_PATTERNS above.
+    Returns 'Other' and prints the SMILES if unmatched -- add it to the patterns above.
     """
     for pattern, family_name in ANION_FAMILY_PATTERNS:
         if pattern in anion_smiles:
             return family_name
-    # DATA QUALITY FLAG: unclassified anion -- print for debugging
+    # DATA QUALITY FLAG: unclassified -- add pattern to ANION_FAMILY_PATTERNS
     print(f"  [NOTE] Unclassified anion SMILES: {anion_smiles}")
     return "Other"
 
@@ -140,12 +141,10 @@ def plot_virtual_library_scatter(all_preds_df: pd.DataFrame,
     For judges: 'We screened N virtual ILs; our top candidates cluster at
     the high-absorption end of the distribution.'
     """
-    # Sort all predictions by x2 descending so rank 1 = best (leftmost on x-axis)
     sorted_preds = all_preds_df.sort_values("x2_predicted", ascending=False).reset_index(drop=True)
     all_log_x2   = sorted_preds["log_x2_predicted"].values
     all_ranks     = np.arange(1, len(all_log_x2) + 1)
 
-    # Top candidates by their rank column from inverse_design.py
     top_ranks  = top_cands_df["rank"].values
     top_log_x2 = top_cands_df["log_x2_predicted"].values
 
@@ -179,10 +178,8 @@ def plot_top_candidates_bar(top_cands_df: pd.DataFrame) -> None:
     This is the primary results figure: it directly shows which novel ILs
     our model predicts will absorb the most CO2.
     """
-    # Sort ascending so highest bar appears at top of horizontal chart
     plot_df = top_cands_df.sort_values("x2_predicted", ascending=True).copy()
 
-    # Truncate SMILES for readability
     labels = [
         s[:MAX_SMILES_LABEL_LEN] + "..." if len(s) > MAX_SMILES_LABEL_LEN else s
         for s in plot_df["il_smiles"].tolist()
@@ -199,7 +196,6 @@ def plot_top_candidates_bar(top_cands_df: pd.DataFrame) -> None:
     ax.xaxis.set_major_formatter(ticker.FormatStrFormatter("%.4f"))
     ax.grid(True, axis="x", linestyle=":", alpha=0.4)
 
-    # Annotate each bar with its numeric value
     for bar_rect, val in zip(bars, plot_df["x2_predicted"]):
         ax.text(val + 0.0001, bar_rect.get_y() + bar_rect.get_height() / 2,
                 f"{val:.4f}", va="center", ha="left", fontsize=7)
@@ -220,7 +216,6 @@ def plot_anion_family_distribution(top_cands_df: pd.DataFrame) -> None:
     top candidates?' Fluorinated anions dominating ([Tf2N]-, [FSI]-) aligns
     with literature -- fluorine increases CO2 affinity via van der Waals.
     """
-    # Classify each top candidate's anion SMILES into a named family
     anion_families = top_cands_df["anion_smiles"].apply(classify_anion_family)
     family_counts   = anion_families.value_counts()
 
@@ -239,7 +234,6 @@ def plot_anion_family_distribution(top_cands_df: pd.DataFrame) -> None:
     ax.tick_params(axis="x", rotation=30)
     ax.grid(True, axis="y", linestyle=":", alpha=0.4)
 
-    # Count label above each bar
     for i, cnt in enumerate(family_counts.values):
         ax.text(i, cnt + 0.05, str(cnt), ha="center", va="bottom", fontsize=10)
 
