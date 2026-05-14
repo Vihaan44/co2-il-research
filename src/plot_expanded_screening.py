@@ -56,8 +56,7 @@ COLOR_PALETTE = [            # distinct colors for family charts
 ]
 MAX_LABEL_LEN = 50  # truncate long SMILES strings in bar chart labels
 
-# SMILES substrings that identify dianion species.
-# These are out-of-distribution for our 1:1 IL model — predictions flagged as unreliable.
+# SMILES substrings identifying dianion species (2:1 salts — outside training distribution)
 DIANION_SUBSTRINGS = [
     "[O-]C(=O)CC([O-])=O",   # malonate2-
     "[O-]C(=O)CCC([O-])=O",  # succinate2-
@@ -68,27 +67,37 @@ DIANION_SUBSTRINGS = [
 # ── Anion family classification ────────────────────────────────────────────────
 # Each entry: (list of substrings ANY must match, family label)
 # Ordered most-specific first to avoid false matches.
+# IMPORTANT: carboxylate pattern must match BOTH orderings:
+#   C(=O)[O-]  AND  C([O-])=O  (RDKit canonical SMILES can write either)
+# Tosylate (arylsulfonate): SMILES is O=S(=O)([O-])c... so must match 'S(=O)([O-])c'
+#   NOT 'S(=O)(=O)([O-])c' — the O= prefix uses up one =O before S
+# Phosphate: match P([O-]) fragment since no standard shorthand
 ANION_FAMILY_PATTERNS = [
-    (["S(=O)(=O)C(F)(F)F"],                          "[Tf2N]-"),
-    (["S(=O)(=O)F)F", "S(=O)(=O)F)S"],               "[FSI]-"),
-    (["[N-](S(=O)(=O)F)C#N"],                        "[SFN]-"),
-    (["S(=O)(=O)([O-])C(F)(F)F", "([O-])C(F)(F)F"],  "[OTf]-"),
-    (["[B-](C#N)(C#N)(C#N)C#N"],                     "[TCB]-"),
-    (["[N-](C#N)C#N"],                               "[DCA]-"),
-    (["[B-](F)(F)(F)F"],                             "[BF4]-"),
-    (["[P-](F)", "F[P-]"],                           "[PF6/FAP]-"),
-    (["[Sb-]"],                                      "[SbF6]-"),
-    # Sulfonate: check isethionate (CCO) and tosylate (c1ccc) specifically first
-    (["S(=O)(=O)([O-])CCO", "([O-])CCO"],            "Isethionate"),
-    (["S(=O)(=O)([O-])c", "([O-])S(=O)(=O)c"],       "Arylsulfonate"),
-    (["OS([O-])(=O)=O", "S([O-])(=O)=O",
-      "S(=O)(=O)[O-]"],                              "Alkylsulfate"),
-    # Heterocyclic anions — check before carboxylate to avoid false match
-    (["NS(=O)(=O)c2ccccc", "O=C1NS"],                "Saccharinate"),
-    (["[N-]C(=O)c2ccccc", "C1[N-]C(=O)"],           "Phthalimide"),
-    (["CC1=CC(=O)[N-]S"],                            "Acesulfamate"),
-    # Carboxylate / TFA — comes after more specific fluorinated checks
-    (["C(=O)[O-]", "[O-]C(=O)"],                    "Carboxylate"),
+    # Fluorinated sulfonyl imides — most specific first
+    (["S(=O)(=O)C(F)(F)F"],                             "[Tf2N]-"),
+    (["S(=O)(=O)F)F", "S(=O)(=O)F)S"],                  "[FSI]-"),
+    (["[N-](S(=O)(=O)F)C#N"],                           "[SFN]-"),
+    (["S(=O)(=O)([O-])C(F)(F)F", "([O-])C(F)(F)F"],     "[OTf]-"),
+    (["[B-](C#N)(C#N)(C#N)C#N"],                        "[TCB]-"),
+    (["[N-](C#N)C#N"],                                  "[DCA]-"),
+    (["[B-](F)(F)(F)F"],                                "[BF4]-"),
+    (["[P-](F)", "F[P-]"],                              "[PF6/FAP]-"),
+    (["[Sb-]"],                                         "[SbF6]-"),
+    # Sulfonate subfamilies — isethionate before arylsulfonate before alkylsulfate
+    (["S(=O)([O-])CCO", "([O-])CCO"],                   "Isethionate"),
+    # Tosylate fix: RDKit writes O=S(=O)([O-])c... so match S(=O)([O-])c (one =O before S)
+    (["S(=O)([O-])c", "S(=O)(=O)([O-])c"],              "Tosylate"),
+    # General alkylsulfate/sulfonate — catch remaining S-O- patterns
+    (["OS([O-])(=O)=O", "S([O-])(=O)=O", "S(=O)(=O)[O-]", "CS([O-])"], "Alkylsulfate"),
+    # Heterocyclic anions — must come before generic carboxylate
+    (["NS(=O)(=O)c2ccccc", "O=C1NS"],                   "Saccharinate"),
+    (["[N-]C(=O)c2ccccc", "C1[N-]C(=O)"],              "Phthalimide"),
+    (["CC1=CC(=O)[N-]S"],                               "Acesulfamate"),
+    # Phosphate: match P([O-]) — covers DEP, DMP, H2PO4
+    (["P([O-])(=O)", "P(=O)([O-])"],                    "Phosphate"),
+    # Carboxylate: match BOTH C(=O)[O-] AND C([O-])=O orderings
+    # Lactate is CC(O)C([O-])=O — the [O-] comes before =O in RDKit canonical form
+    (["C(=O)[O-]", "[O-]C(=O)", "C([O-])=O"],           "Carboxylate"),
     (["[Cl-]"],  "[Cl]-"),
     (["[Br-]"],  "[Br]-"),
     (["[I-]"],   "[I]-"),
@@ -100,7 +109,8 @@ ANION_FAMILY_PATTERNS = [
 def classify_anion(anion_smiles: str) -> str:
     """
     Map an anion SMILES to a family label using substring matching.
-    Returns 'Other' and prints if nothing matches — helps us catch gaps.
+    Returns 'Other' and prints the SMILES if no pattern matches — signals
+    that ANION_FAMILY_PATTERNS needs a new entry for that anion type.
     """
     for substrings, family in ANION_FAMILY_PATTERNS:
         if any(s in anion_smiles for s in substrings):
@@ -112,8 +122,7 @@ def classify_anion(anion_smiles: str) -> str:
 def is_dianion(il_smiles: str) -> bool:
     """
     Returns True if this IL's SMILES contains a known dianion fragment.
-    Dianion ILs are 2:1 salts — outside the training distribution of 1:1 ILs.
-    Predictions for these should be flagged as unreliable extrapolation.
+    Dianion ILs (2:1 salts) are outside the training distribution of 1:1 ILs.
     """
     return any(sub in il_smiles for sub in DIANION_SUBSTRINGS)
 
@@ -145,8 +154,8 @@ def plot_scatter(all_preds_df: pd.DataFrame, top_cands_df: pd.DataFrame) -> None
     Shows how the top candidates relate to the full distribution of 1226 ILs.
     """
     sorted_df = all_preds_df.sort_values("x2_predicted", ascending=False).reset_index(drop=True)
-    ranks      = np.arange(1, len(sorted_df) + 1)
-    log_x2     = sorted_df["log_x2_predicted"].values
+    ranks     = np.arange(1, len(sorted_df) + 1)
+    log_x2    = sorted_df["log_x2_predicted"].values
 
     top_ranks  = top_cands_df["rank"].values
     top_log_x2 = top_cands_df["log_x2_predicted"].values
@@ -173,18 +182,11 @@ def plot_scatter(all_preds_df: pd.DataFrame, top_cands_df: pd.DataFrame) -> None
 def plot_top20_bar(top_cands_df: pd.DataFrame) -> None:
     """
     Horizontal bar chart of predicted x2 for top 20 candidates.
-    Dianion candidates shown in orange with a warning label — these are
-    out-of-distribution for our 1:1 IL model and may be unreliable.
-
-    WHY FLAG DIANIONS: The model was trained only on 1:1 ionic liquids
-    (one cation, one anion). A dianion like malonate2- requires a 2:1 stoichiometry
-    (two cations per anion), making it a different compound class.
-    High predicted x2 may be an artifact of model extrapolation.
+    Dianion candidates shown in orange — out-of-distribution for 1:1 IL model.
     """
     plot_df = top_cands_df.sort_values("x2_predicted", ascending=True).copy()
     plot_df["dianion_flag"] = plot_df["il_smiles"].apply(is_dianion)
 
-    # Short labels: truncate SMILES and append dianion warning
     def make_label(row):
         smi = row["il_smiles"]
         label = smi[:MAX_LABEL_LEN] + ("..." if len(smi) > MAX_LABEL_LEN else "")
@@ -201,12 +203,10 @@ def plot_top20_bar(top_cands_df: pd.DataFrame) -> None:
     bars = ax.barh(labels, plot_df["x2_predicted"],
                    color=colors, edgecolor="white", linewidth=0.4, alpha=0.9)
 
-    # Value labels at end of each bar
     for bar_rect, val in zip(bars, plot_df["x2_predicted"]):
         ax.text(val + 0.0002, bar_rect.get_y() + bar_rect.get_height() / 2,
                 f"{val:.4f}", va="center", ha="left", fontsize=7)
 
-    # Legend entries for color coding
     from matplotlib.patches import Patch
     legend_handles = [
         Patch(color=COLOR_NORMAL,  label="Valid 1:1 IL prediction"),
@@ -216,8 +216,7 @@ def plot_top20_bar(top_cands_df: pd.DataFrame) -> None:
 
     ax.set_xlabel(r"Predicted CO$_2$ Mole Fraction Solubility (x$_2$)", fontsize=11)
     ax.set_title(f"Top {TOP_N} Expanded Library Candidates\n"
-                 f"(orange = dianion anion, out-of-distribution for this model)",
-                 fontsize=11)
+                 "(orange = dianion anion, out-of-distribution for this model)", fontsize=11)
     ax.tick_params(axis="y", labelsize=7)
     ax.xaxis.set_major_formatter(ticker.FormatStrFormatter("%.4f"))
     ax.grid(True, axis="x", linestyle=":", alpha=0.4)
@@ -232,16 +231,15 @@ def plot_top20_bar(top_cands_df: pd.DataFrame) -> None:
 def plot_cation_families(top_cands_df: pd.DataFrame) -> None:
     """
     Bar chart of cation family counts in the top 20.
-    If ammonium dominates, that's a meaningful result: the NH2-functionalized
-    ammonium cation structure is uniquely predicted to favor CO2 absorption.
-    If novel families (sulfonium, guanidinium) appear, that's a new finding.
+    Ammonium dominance = NH2-functionalized quaternary ammonium is uniquely favored.
+    Novel families absent = sulfonium/guanidinium/pyridinium don't compete here.
     """
     if "cation_family" not in top_cands_df.columns:
         print("[plot_cation_families] No cation_family column — skipping")
         return
 
-    counts  = top_cands_df["cation_family"].value_counts()
-    colors  = COLOR_PALETTE[:len(counts)]
+    counts = top_cands_df["cation_family"].value_counts()
+    colors = COLOR_PALETTE[:len(counts)]
 
     print(f"  Cation family breakdown in top {TOP_N}: {dict(counts)}")
 
@@ -269,9 +267,8 @@ def plot_cation_families(top_cands_df: pd.DataFrame) -> None:
 def plot_anion_families(top_cands_df: pd.DataFrame) -> None:
     """
     Bar chart of anion family counts in the top 20 expanded screening candidates.
-    Compared to Phase 4 (dominated by [Tf2N]-/[FSI]-), the expanded library
-    introduces isethionate, saccharinate, and tosylate — shows whether these
-    novel anions genuinely compete with fluorinated anions.
+    Compared to Phase 4 (dominated by [Tf2N]-), the expanded library introduces
+    isethionate, saccharinate, tosylate — shows whether novel anions compete.
     """
     families = top_cands_df["anion_smiles"].apply(classify_anion)
     counts   = families.value_counts()
@@ -288,7 +285,7 @@ def plot_anion_families(top_cands_df: pd.DataFrame) -> None:
     ax.set_xlabel("Anion Family", fontsize=11)
     ax.set_ylabel(f"Count in Top {TOP_N}", fontsize=11)
     ax.set_title(f"Anion Family Distribution — Top {TOP_N} Expanded Screening Candidates\n"
-                 f"(compare to Phase 4: [Tf2N]- dominated)", fontsize=11)
+                 "(compare to Phase 4: [Tf2N]- dominated)", fontsize=11)
     ax.tick_params(axis="x", rotation=25)
     ax.grid(True, axis="y", linestyle=":", alpha=0.4)
 
