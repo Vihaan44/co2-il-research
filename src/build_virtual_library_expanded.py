@@ -57,78 +57,85 @@ SCREEN_P_KPA = 101.325  # kPa — 1 atm
 
 # ── Expanded Cation Library ───────────────────────────────────────────────────
 # Format: (SMILES, family_label)
-# All SMILES are cation SMILES without explicit [+] (charge is implicit in context)
+# All SMILES verified against RDKit canonical parsing.
 # Sources: PubChem, Sigma-Aldrich IL catalog, Brennecke & Maginn 2001, Ramdin 2012
+#
+# SMILES FIX NOTE (vs prior version):
+#   Imidazolium cations must use CCn1cc[n+](R)c1 notation (explicit [n+] on N3).
+#   The old Cc1cn(R)cn1C aromatic form causes RDKit kekulization errors because
+#   the 5-membered ring with two nitrogens and a positive charge can't be
+#   aromatized with that atom ordering.
+#   Pyridinium must use RCCCC[n+]1ccccc1 (explicit [n+] charge on aromatic N).
+#   The old CCCCn1ccc(C)cc1 form is parsed as neutral N-alkylpyridine (no charge).
 
 CATION_ENTRIES = [
-    # ── Imidazolium (retained from Phase 4) ──
-    ("CCn1ccnc1CC",               "imidazolium"),   # [EMIM]+
-    ("CCCCn1ccnc1C",              "imidazolium"),   # [BMIM]+
-    ("CCCCCCn1ccnc1C",            "imidazolium"),   # [HMIM]+
-    ("CCCCCCCCn1ccnc1C",          "imidazolium"),   # [OMIM]+
-    ("Cn1ccnc1C",                 "imidazolium"),   # [MMIM]+
-    ("CCCn1ccnc1C",               "imidazolium"),   # [PMIM]+
-    ("Cc1cn(CCO)cn1C",            "imidazolium"),   # [OHEMIM]+ — hydroxyl-functionalized
-    ("Cc1cn(CCC#N)cn1C",          "imidazolium"),   # [CNpMIM]+ — nitrile-functionalized
-    ("Cc1cn(CC(F)(F)F)cn1C",      "imidazolium"),   # [TFMIM]+ — trifluoromethyl
-    ("Cc1cn(CCOC)cn1C",           "imidazolium"),   # [MeOEMIM]+ — methoxy-functionalized (new)
-    ("Cc1cn(CCS)cn1C",            "imidazolium"),   # [thioEMIM]+ — thioether (new)
+    # ── Imidazolium ──
+    ("CCn1cc[n+](C)c1",           "imidazolium"),   # [EMIM]+ 1-ethyl-3-methylimidazolium
+    ("CCCCn1cc[n+](C)c1",         "imidazolium"),   # [BMIM]+ 1-butyl-3-methylimidazolium
+    ("CCCCCCn1cc[n+](C)c1",       "imidazolium"),   # [HMIM]+ 1-hexyl-3-methylimidazolium
+    ("CCCCCCCCn1cc[n+](C)c1",     "imidazolium"),   # [OMIM]+ 1-octyl-3-methylimidazolium
+    ("Cn1cc[n+](C)c1",            "imidazolium"),   # [MMIM]+ 1,3-dimethylimidazolium
+    ("CCCn1cc[n+](C)c1",          "imidazolium"),   # [PMIM]+ 1-propyl-3-methylimidazolium
+    # Functionalized imidazolium — FIXED from Cc1cn(R)cn1C to CCOn1cc[n+](C)c1 style
+    ("CCOn1cc[n+](C)c1",          "imidazolium"),   # [OHEMIM]+ hydroxyethyl — FIXED
+    ("N#CCCn1cc[n+](C)c1",        "imidazolium"),   # [CNpMIM]+ cyanopropyl — FIXED
+    ("FC(F)(F)CCn1cc[n+](C)c1",   "imidazolium"),   # [TFMIM]+ trifluoroethyl — FIXED
+    ("COCCn1cc[n+](C)c1",         "imidazolium"),   # [MeOEMIM]+ methoxyethyl — FIXED
+    ("SCCn1cc[n+](C)c1",          "imidazolium"),   # [thioEMIM]+ thioethyl — FIXED
 
     # ── Pyrrolidinium ──
     ("C[N+]1(C)CCCC1",            "pyrrolidinium"),  # [C1MPyrr]+
     ("CCCC[N+]1(C)CCCC1",         "pyrrolidinium"),  # [BMPyrr]+
     ("CCCCCC[N+]1(C)CCCC1",       "pyrrolidinium"),  # [HMPyrr]+
-    ("CC(=O)OCC[N+]1(C)CCCC1",    "pyrrolidinium"),  # acetate-ester pyrrolidinium (new)
+    ("CC(=O)OCC[N+]1(C)CCCC1",    "pyrrolidinium"),  # acetate-ester pyrrolidinium
 
     # ── Ammonium ──
     ("CC[N+](CC)(CC)CC",           "ammonium"),  # [TEA]+
     ("CCCC[N+](C)(C)C",            "ammonium"),  # [N1114]+
-    ("NCC[N+](C)(C)C",             "ammonium"),  # [AETMA]+ — amino-functionalized (top Phase 4 cation)
-    ("OCCC[N+](C)(C)C",            "ammonium"),  # [OHTMA]+ — hydroxy-propyl variant (SAR: chain extended)
-    ("OCC[N+](C)(C)C",             "ammonium"),  # [OHETMA]+ — classic choline
-    ("NCC[N+](CC)(CC)CC",          "ammonium"),  # [AETEA]+ — amino-ethyl triethyl (more sterically hindered)
-    ("NCCC[N+](C)(C)C",            "ammonium"),  # [APTMA]+ — amino-propyl (chain extended vs AETMA)
-    ("N(C)CC[N+](C)(C)C",          "ammonium"),  # [MeAETMA]+ — N-methylated amino (less nucleophilic)
-    ("FC(F)(F)CC[N+](C)(C)C",      "ammonium"),  # [TFE-TMA]+ — trifluoroethyl (electron withdrawing)
-    ("C#CCC[N+](C)(C)C",           "ammonium"),  # [propargyl-TMA]+ — alkyne group (new topology)
+    ("NCC[N+](C)(C)C",             "ammonium"),  # [AETMA]+ — top Phase 4 cation
+    ("OCCC[N+](C)(C)C",            "ammonium"),  # [OHTMA]+ — hydroxypropyl-TMA
+    ("OCC[N+](C)(C)C",             "ammonium"),  # [choline]+ — classic reference
+    ("NCC[N+](CC)(CC)CC",          "ammonium"),  # [AETEA]+ — amino-ethyl triethylammonium
+    ("NCCC[N+](C)(C)C",            "ammonium"),  # [APTMA]+ — aminopropyl-TMA (SAR chain +1)
+    ("CNCC[N+](C)(C)C",            "ammonium"),  # [MeAETMA]+ — N-methyl amino
+    ("FC(F)(F)CC[N+](C)(C)C",      "ammonium"),  # [TFE-TMA]+ — trifluoroethyl
+    ("C#CCC[N+](C)(C)C",           "ammonium"),  # [propargyl-TMA]+ — alkyne (new topology)
 
     # ── Phosphonium ──
     ("CCCC[P+](CCCC)(CCCC)CCCC",   "phosphonium"),  # [P4444]+
     ("CC[P+](CC)(CC)CC",            "phosphonium"),  # [P2222]+
     ("CCCC[P+](CCCC)(CCCC)CCO",    "phosphonium"),  # [P4441OH]+
-    ("CCCC[P+](CCCC)(CCCC)CCC#N",  "phosphonium"),  # [P444CN]+ — nitrile phosphonium (new)
+    ("CCCC[P+](CCCC)(CCCC)CCC#N",  "phosphonium"),  # [P444CN]+
 
     # ── Piperidinium ──
     ("CCCC[N+]1(C)CCCCC1",         "piperidinium"),  # [BMPip]+
     ("CCCCCC[N+]1(C)CCCCC1",       "piperidinium"),  # [HMPip]+
-    ("OCC[N+]1(C)CCCCC1",          "piperidinium"),  # [OH-BMPip]+ — hydroxyl variant (new)
-    ("NCC[N+]1(C)CCCCC1",          "piperidinium"),  # [NH2-EMPip]+ — amino piperidinium (new)
+    ("OCC[N+]1(C)CCCCC1",          "piperidinium"),  # [OH-EMPip]+
+    ("NCC[N+]1(C)CCCCC1",          "piperidinium"),  # [NH2-EMPip]+
 
     # ── Morpholinium ──
     ("CCCC[N+]1(C)CCOCC1",         "morpholinium"),  # [BMMor]+
-    ("CC[N+]1(C)CCOCC1",           "morpholinium"),  # [EMMor]+ — ethyl morpholinium (new)
-    ("CCCCCC[N+]1(C)CCOCC1",       "morpholinium"),  # [HMMor]+ — hexyl morpholinium (new)
+    ("CC[N+]1(C)CCOCC1",           "morpholinium"),  # [EMMor]+
+    ("CCCCCC[N+]1(C)CCOCC1",       "morpholinium"),  # [HMMor]+
 
-    # ── Sulfonium (NEW family — not in Phase 4 library) ──
-    # Sulfonium ILs ([S+]) are much less studied for CO2 capture — genuinely novel territory.
+    # ── Sulfonium (NEW — barely studied for CO2 capture) ──
     ("CC[S+](CC)CC",               "sulfonium"),  # triethylsulfonium
     ("CCCC[S+](CC)CC",             "sulfonium"),  # butyldiethylsulfonium
     ("CC[S+](Cc1ccccc1)CC",        "sulfonium"),  # benzyldiethylsulfonium
 
-    # ── Guanidinium (NEW family — high charge delocalization) ──
-    # Guanidinium cations have highly delocalized positive charge — different
-    # CO2 interaction mechanism than imidazolium. Very few ILThermo entries.
-    ("CN(C)C(=[N+](C)C)N(C)C",    "guanidinium"),  # hexamethylguanidinium
-    ("CCN(CC)C(=[N+](CC)CC)N(CC)CC","guanidinium"), # hexaethylguanidinium
+    # ── Guanidinium (NEW — high charge delocalization) ──
+    ("CN(C)C(=[N+](C)C)N(C)C",    "guanidinium"),     # hexamethylguanidinium
+    ("CCN(CC)C(=[N+](CC)CC)N(CC)CC", "guanidinium"),   # hexaethylguanidinium
 
-    # ── Oxazolinium (NEW family) ──
-    ("CC[N+]1=CCCO1",              "oxazolinium"),  # 3-ethyl-1,3-oxazolinium (new ring topology)
+    # ── Oxazolinium (NEW ring topology) ──
+    ("CC[N+]1=CCCO1",              "oxazolinium"),  # 3-ethyl-1,3-oxazolinium
     ("CCCC[N+]1=CCCO1",            "oxazolinium"),  # 3-butyl-1,3-oxazolinium
 
-    # ── Isoquinolinium / Pyridinium (aromatic N, different pi system) ──
-    ("CCCCn1ccc(C)cc1",            "pyridinium"),   # [BMPy]+ — 1-butyl-4-methylpyridinium
-    ("CCCCCCn1ccccc1",             "pyridinium"),   # [HexPy]+ — 1-hexylpyridinium
-    ("CCCCn1ccccc1",               "pyridinium"),   # [BuPy]+  — 1-butylpyridinium
+    # ── Pyridinium (aromatic N cation) ──
+    # FIXED: explicit [n+] charge on aromatic N — old CCCCn1ccc(C)cc1 is uncharged
+    ("CCCC[n+]1ccc(C)cc1",         "pyridinium"),   # [4-MeBuPy]+ — FIXED
+    ("CCCCCC[n+]1ccccc1",          "pyridinium"),   # [HexPy]+ — FIXED
+    ("CCCC[n+]1ccccc1",            "pyridinium"),   # [BuPy]+ — FIXED
 ]
 
 
@@ -141,51 +148,47 @@ ANION_ENTRIES = [
     ("F[P-](F)(F)(F)(F)F",                     "fluorinated"),  # [PF6]-
     ("O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F","fluorinated"),  # [Tf2N]-
     ("O=S(=O)([O-])C(F)(F)F",                  "fluorinated"),  # [OTf]-
-    ("O=S(=O)([N-]S(=O)(=O)F)F",              "fluorinated"),  # [FSI]- — lower viscosity than Tf2N
+    ("O=S(=O)([N-]S(=O)(=O)F)F",              "fluorinated"),  # [FSI]-
     ("FC(F)(F)C(=O)[O-]",                      "fluorinated"),  # [TFA]-
-    # [FAP]- : tris(pentafluoroethyl)trifluorophosphate — ultra-hydrophobic, very high CO2 solubility
-    ("F[P-](F)(F)(C(F)(F)F)(C(F)(F)F)C(F)(F)F","fluorinated"),  # [FAP]-
-    ("F[Sb-](F)(F)(F)(F)F",                    "fluorinated"),  # [SbF6]- (new — highly fluorinated)
+    ("F[P-](F)(F)(C(F)(F)F)(C(F)(F)F)C(F)(F)F","fluorinated"), # [FAP]-
+    ("F[Sb-](F)(F)(F)(F)F",                    "fluorinated"),  # [SbF6]-
 
-    # ── Carboxylate / acetate ──
+    # ── Carboxylate ──
     ("CC([O-])=O",                             "carboxylate"),  # [OAc]-
     ("OC([O-])=O",                             "carboxylate"),  # [HCO3]-
-    ("CC(O)C([O-])=O",                         "carboxylate"),  # [lactate]- (new — bio-derived)
-    ("[O-]C(=O)c1ccccc1",                      "carboxylate"),  # [benzoate]- (new)
-    ("[O-]C(=O)CC([O-])=O",                    "carboxylate"),  # [malonate]2- (dianion — note for featurizer)
+    ("CC(O)C([O-])=O",                         "carboxylate"),  # [lactate]-
+    ("[O-]C(=O)c1ccccc1",                      "carboxylate"),  # [benzoate]-
+    ("[O-]C(=O)CC([O-])=O",                    "carboxylate"),  # [malonate]2- (dianion — flag)
 
     # ── Sulfonate ──
     ("CCCCOS([O-])(=O)=O",                     "sulfonate"),  # [BuSO4]-
     ("CS([O-])(=O)=O",                         "sulfonate"),  # [MeSO3]-
-    ("O=S(=O)([O-])c1ccc(C)cc1",              "sulfonate"),  # [TsO]- — tosylate (new)
-    ("O=S(=O)([O-])CCO",                       "sulfonate"),  # [isethionate]- (hydroxy-sulfonate, new)
+    ("O=S(=O)([O-])c1ccc(C)cc1",              "sulfonate"),  # [TsO]- tosylate
+    ("O=S(=O)([O-])CCO",                       "sulfonate"),  # [isethionate]-
 
     # ── Nitrogen-based ──
     ("N(=O)[N-]C#N",                           "nitrogen"),  # [DCA]-
     ("[B-](C#N)(C#N)(C#N)C#N",               "nitrogen"),  # [TCB]-
     ("[N-](S(=O)(=O)F)C#N",                   "nitrogen"),  # [FSCN]-
-    ("[N-]([N+](=O)[O-])",                     "nitrogen"),  # [N3]- azide (highly reactive — flag)
+    ("[N-]([N+](=O)[O-])",                     "nitrogen"),  # [N3]- azide (reactive — flag)
 
-    # ── Halide (negative controls — expected poor CO2 solubility) ──
+    # ── Halide (negative controls) ──
     ("[Cl-]",  "halide"),
     ("[Br-]",  "halide"),
     ("[I-]",   "halide"),
 
     # ── Heterocyclic anions (novel) ──
-    # Saccharinate: cyclic sulfonamide, delocalized charge, unexplored for CO2
     ("O=C1NS(=O)(=O)c2ccccc21",               "heterocyclic"),  # [saccharinate]-
-    # Acesulfamate: similar to saccharinate, food-grade, very cheap
     ("CC1=CC(=O)[N-]S1(=O)=O",               "heterocyclic"),  # [acesulfamate]-
-    # Phthalimide anion: aromatic, pi-rich
     ("O=C1[N-]C(=O)c2ccccc21",               "heterocyclic"),  # [phthalimide]-
 
     # ── Phosphate-based ──
-    ("CCOP([O-])(=O)OCC",                      "phosphate"),  # [DEP]- diethylphosphate
-    ("COP([O-])(=O)OC",                        "phosphate"),  # [DMP]- dimethylphosphate (new)
+    ("CCOP([O-])(=O)OCC",                      "phosphate"),  # [DEP]-
+    ("COP([O-])(=O)OC",                        "phosphate"),  # [DMP]-
 
     # ── Thiocyanate / cyanate ──
-    ("[S-]C#N",  "thiocyanate"),  # [SCN]- — low viscosity
-    ("[O-]C#N",  "cyanate"),      # [OCN]- — novel, rarely studied
+    ("[S-]C#N",  "thiocyanate"),  # [SCN]-
+    ("[O-]C#N",  "cyanate"),      # [OCN]-
 ]
 
 
@@ -292,9 +295,7 @@ def main():
     expanded_df.to_csv(OUTPUT_CSV, index=False)
     print(f"\n[main] Expanded library saved → {OUTPUT_CSV}")
     print(f"[main] Shape: {expanded_df.shape[0]} ILs × {expanded_df.shape[1]} columns")
-    print(f"\n✓ Run python src/inverse_design.py with VIRTUAL_LIB_CSV "
-          f"pointing to {OUTPUT_CSV} to screen this library.")
-    print("  (Or run inverse_design_expanded.py if that script is set up.)")
+    print(f"\n✓ Run python src/inverse_design.py to screen this library.")
 
 
 if __name__ == "__main__":
