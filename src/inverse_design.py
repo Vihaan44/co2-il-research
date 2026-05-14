@@ -36,12 +36,19 @@ LIMITATION (honest, for judges):
   is essential before claiming these candidates are genuinely superior.
 
 INPUTS:
-  models/forward_model.pkl                       (model bundle from train_model.py)
-  data/virtual_library/virtual_il_library.csv   (from build_virtual_library.py)
+  models/forward_model.pkl
+      Model bundle from train_model.py (contains model + feature_cols).
+  data/virtual_library/virtual_il_library_expanded.csv
+      Expanded 889-IL library from build_virtual_library_expanded.py.
+      Covers 38 cations x 31 anions across 9 families including sulfonium,
+      guanidinium, oxazolinium, and heterocyclic anions not in Phase 4.
 
 OUTPUTS:
-  results/virtual_library_predictions.csv        (all candidates, ranked)
-  results/top_candidates.csv                     (top 20 candidates for DFT)
+  results/virtual_library_predictions_expanded.csv   (all candidates, ranked)
+  results/top_candidates_expanded.csv                (top 20 candidates for DFT)
+
+NOTE: Phase 4 results (virtual_library_predictions.csv / top_candidates.csv) are
+      preserved unchanged. This script writes to separate _expanded files.
 
 Run from project root:
     python src/inverse_design.py
@@ -53,11 +60,16 @@ import numpy as np
 import pandas as pd
 import joblib
 
-# -- Constants -----------------------------------------------------------------
+# ── Constants ──────────────────────────────────────────────────────────────────
 MODEL_PATH         = os.path.join("models", "forward_model.pkl")
-VIRTUAL_LIB_CSV   = os.path.join("data", "virtual_library", "virtual_il_library.csv")
-ALL_PREDS_CSV      = os.path.join("results", "virtual_library_predictions.csv")
-TOP_CANDIDATES_CSV = os.path.join("results", "top_candidates.csv")
+
+# Points to the expanded library (889 novel ILs across 9 cation families)
+# Change this path to virtual_il_library.csv to re-screen the original Phase 4 library
+VIRTUAL_LIB_CSV   = os.path.join("data", "virtual_library", "virtual_il_library_expanded.csv")
+
+# Output files — separate from Phase 4 results to avoid overwriting
+ALL_PREDS_CSV      = os.path.join("results", "virtual_library_predictions_expanded.csv")
+TOP_CANDIDATES_CSV = os.path.join("results", "top_candidates_expanded.csv")
 
 TOP_N_CANDIDATES = 20     # how many to save for DFT validation
 X2_MIN_PHYSICAL  = 1e-7   # below this is physically implausible for CO2 in IL
@@ -104,16 +116,18 @@ def load_model_bundle(model_path: str) -> tuple:
 
 def load_virtual_library(csv_path: str) -> pd.DataFrame:
     """
-    Load the virtual IL library CSV produced by build_virtual_library.py.
+    Load the virtual IL library CSV.
     Validates required columns before proceeding.
+    Accepts both the original library and the expanded library — both share
+    the same required columns.
     """
     if not os.path.exists(csv_path):
         raise FileNotFoundError(
-            f"Virtual library not found at {csv_path}. "
-            f"Run src/build_virtual_library.py first."
+            f"Virtual library not found at {csv_path}.\n"
+            f"Run src/build_virtual_library_expanded.py first."
         )
     virtual_lib_df = pd.read_csv(csv_path)
-    print(f"[load_virtual_library] {virtual_lib_df.shape[0]} IL candidates loaded")
+    print(f"[load_virtual_library] {virtual_lib_df.shape[0]} IL candidates loaded from {csv_path}")
 
     required_cols = ["il_smiles", "cation_smiles", "anion_smiles", "T_K", "P_kPa"]
     missing = [c for c in required_cols if c not in virtual_lib_df.columns]
@@ -266,8 +280,14 @@ def main():
     print(f"[main] x2 range:        [{x2_predicted.min():.2e}, {x2_predicted.max():.2e}]")
 
     # -- Step 5: Assemble, filter, rank --------------------------------------
-    predictions_df = valid_meta_df[["il_smiles", "cation_smiles", "anion_smiles",
-                                    "T_K", "P_kPa"]].copy()
+    # Include cation_family and anion_family if present in the expanded library
+    meta_cols = ["il_smiles", "cation_smiles", "anion_smiles", "T_K", "P_kPa"]
+    optional_cols = ["cation_family", "anion_family"]
+    for col in optional_cols:
+        if col in valid_meta_df.columns:
+            meta_cols.append(col)
+
+    predictions_df = valid_meta_df[meta_cols].copy()
     predictions_df["log_x2_predicted"] = log_x2_predicted
     predictions_df["x2_predicted"]     = x2_predicted
 
@@ -285,6 +305,11 @@ def main():
                                    "log_x2_predicted",
                                    "x2_predicted"]].to_string(index=False))
 
+    # Print family breakdown of top 20 if family columns available
+    if "cation_family" in predictions_df.columns:
+        print("\nCation family breakdown in top 20:")
+        print(predictions_df.head(20)["cation_family"].value_counts().to_string())
+
     # -- Step 6: Save --------------------------------------------------------
     predictions_df.to_csv(ALL_PREDS_CSV, index=False)
     print(f"\n[main] All predictions saved -> {ALL_PREDS_CSV}")
@@ -293,7 +318,7 @@ def main():
     top_candidates_df.to_csv(TOP_CANDIDATES_CSV, index=False)
     print(f"[main] Top {TOP_N_CANDIDATES} candidates saved -> {TOP_CANDIDATES_CSV}")
 
-    print(f"\nPhase 4 inverse design complete.")
+    print(f"\nExpanded library screening complete.")
     print(f"  Best predicted IL:  {top_candidates_df.iloc[0]['il_smiles']}")
     print(f"  Predicted x2_CO2:  {top_candidates_df.iloc[0]['x2_predicted']:.4e}")
     print(f"  Next: DFT validation -> Phase 5")
