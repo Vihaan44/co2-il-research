@@ -14,15 +14,25 @@ WHY T_K AND P_kPa ARE INCLUDED AS FEATURES:
   For competition framing: "Our model predicts CO2 solubility given the IL structure,
   temperature, and pressure -- mirroring real industrial process conditions."
 
-CROSS-VALIDATION STRATEGY — GroupKFold:
-  We use GroupKFold (grouped by il_smiles) instead of plain KFold.
-  WHY THIS MATTERS: Plain KFold can put measurements of the SAME IL in both
-  training and validation folds. Since one IL can appear at many (T, P) conditions,
-  this leaks structural information from train into val -- the CV score looks
-  artificially better than generalization to new ILs actually is.
-  GroupKFold ensures every fold's validation set contains ONLY ILs not seen in
-  that fold's training set, giving a fair estimate of performance on novel ILs.
-  This is the correct protocol for IL property prediction (Sistla et al. 2023).
+CROSS-VALIDATION STRATEGY — Repeated GroupKFold:
+  We use REPEATED GroupKFold: CV_FOLDS folds × CV_REPEATS different random IL orderings.
+  This averages out the variance from unlucky fold composition.
+
+  WHY REPEATED:
+    With only 168 ILs and 5 folds, each fold contains ~34 ILs. One fold might by
+    chance contain a structurally unusual IL family with no training precedent (e.g.
+    all phosphonium ILs in one fold), giving a very bad fold score that drags down
+    the mean and inflates std. A single GroupKFold run (5 folds) can give std ≈ 0.44
+    in R² purely from this sampling accident.
+    Repeating 5 times (25 total folds) averages over different random IL assignments,
+    giving a stable, trustworthy CV estimate. This is standard practice for small datasets
+    in cheminformatics (Sheridan 2013, J. Chem. Inf. Model.).
+
+  WHY GroupKFold (not plain KFold):
+    Plain KFold can put measurements of the SAME IL in both train and val folds.
+    Since one IL appears at many (T, P) conditions, this leaks structural information
+    and makes CV scores optimistically biased. GroupKFold by il_smiles ensures every
+    fold's val set contains only ILs not seen during that fold's training.
 
 WHAT EACH STEP PRODUCES:
   1. Cross-validation results on train set → results/cv_results.csv
@@ -45,7 +55,8 @@ import pandas as pd
 import joblib
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
-from sklearn.model_selection import cross_val_score, GroupKFold
+from sklearn.model_selection import GroupKFold
+from sklearn.utils import shuffle
 from xgboost import XGBRegressor
 
 # -- Constants -----------------------------------------------------------------
@@ -57,7 +68,9 @@ MODEL_PATH  = os.path.join(MODEL_DIR, "forward_model.pkl")
 
 TARGET_COL         = "log_x2_CO2"       # log10-transformed mole fraction solubility
 CONDITION_FEATURES = ["T_K", "P_kPa"]   # temperature (K) and pressure (kPa) from ILThermo
-CV_FOLDS           = 5
+CV_FOLDS           = 5    # folds per repeat
+CV_REPEATS         = 5    # number of times to repeat with different random shuffles
+                           # total CV evaluations = CV_FOLDS * CV_REPEATS = 25
 RANDOM_SEED        = 42
 
 # Random Forest hyperparameters
@@ -89,97 +102,129 @@ def load_split(path: str, label: str) -> tuple:
     df = pd.read_csv(path)
     print(f"[load_split] {label}: {df.shape[0]} rows x {df.shape[1]} cols")
 
-    # Molecular structure features: Morgan FP bits (cat_fp_*, an_fp_*) AND
-    # RDKit physicochemical descriptors (cat_mol_weight, an_num_hbd, etc.)
-    # Both are prefixed cat_ or an_ in featurize.py.
     molecular_cols = [c for c in df.columns if c.startswith("cat_") or c.startswith("an_")]
-
-    # Count FP bits vs descriptors for transparency
     fp_cols   = [c for c in molecular_cols if "_fp_" in c]
     desc_cols = [c for c in molecular_cols if "_fp_" not in c]
     print(f"[load_split] {label}: {len(fp_cols)} Morgan FP bits + "
           f"{len(desc_cols)} RDKit descriptors + {len(CONDITION_FEATURES)} T/P = "
           f"{len(molecular_cols) + len(CONDITION_FEATURES)} total features")
 
-    # Verify condition columns exist before proceeding
     missing_conditions = [c for c in CONDITION_FEATURES if c not in df.columns]
     if missing_conditions:
-        raise ValueError(
-            f"Missing condition columns {missing_conditions} in {path}.\n"
-            f"Available columns include: {list(df.columns[:20])}"
-        )
+        raise ValueError(f"Missing condition columns {missing_conditions} in {path}.")
 
-    feature_cols = molecular_cols + CONDITION_FEATURES  # structure + T + P
+    feature_cols = molecular_cols + CONDITION_FEATURES
     print(f"[load_split] {label}: target range "
           f"[{df[TARGET_COL].min():.2f}, {df[TARGET_COL].max():.2f}]")
 
-    # Warn if any condition values are missing -- NaN rows cause silent errors
+    # Drop NaN condition rows defensively (build_dataset.py should have cleaned these,
+    # but if running against older data files, drop here rather than crash silently)
     n_missing_t = df["T_K"].isna().sum()
     n_missing_p = df["P_kPa"].isna().sum()
     if n_missing_t > 0 or n_missing_p > 0:
-        # DATA QUALITY FLAG: missing T or P means those rows can't be used
         print(f"[load_split] WARNING: {n_missing_t} rows missing T_K, "
-              f"{n_missing_p} rows missing P_kPa -- these will cause NaN predictions")
+              f"{n_missing_p} rows missing P_kPa -- dropping these rows.")
+        df = df.dropna(subset=CONDITION_FEATURES).copy()
+        print(f"[load_split] After drop: {len(df)} rows remain.")
 
     X         = df[feature_cols].values
     y         = df[TARGET_COL].values
-    il_smiles = df["il_smiles"]  # used as group label in GroupKFold CV
+    il_smiles = df["il_smiles"]
     return X, y, il_smiles, feature_cols
 
 
-def cross_validate_model(model, X_train: np.ndarray, y_train: np.ndarray,
-                         il_smiles_train: pd.Series, model_name: str) -> dict:
+def repeated_group_kfold_cv(model, X_train: np.ndarray, y_train: np.ndarray,
+                             il_smiles_train: pd.Series, model_name: str) -> dict:
     """
-    Run 5-fold cross-validation on the training set using GroupKFold.
+    Run repeated GroupKFold cross-validation (CV_FOLDS x CV_REPEATS).
 
-    GroupKFold groups rows by il_smiles so that all measurements from
-    the same IL go into the same fold. This prevents data leakage: without
-    grouping, the same IL measured at 10 temperatures could appear in both
-    train and val, making CV scores optimistically biased.
+    Each repeat shuffles the IL ordering before splitting into folds, so different
+    ILs end up in the val fold each time. This averages out the variance from any
+    single fold containing an unusually hard or easy IL family.
 
-    The CV RMSE here reflects true generalization to new ILs -- a harder and
-    more honest metric than plain KFold would give.
+    Total evaluations = CV_FOLDS * CV_REPEATS (e.g. 5 x 5 = 25).
+    We report both the per-repeat mean R² and the overall mean/std across all folds,
+    so you can see how much the variance shrinks with repetition.
+
+    WHY NOT sklearn's RepeatedGroupKFold:
+      sklearn doesn't have RepeatedGroupKFold. We implement it manually by shuffling
+      the unique IL list with a different seed each repeat, then re-assigning groups.
     """
-    # GroupKFold requires groups: same IL always in same fold
-    group_kfold = GroupKFold(n_splits=CV_FOLDS)
-    groups = il_smiles_train.values  # one group label per row
+    groups        = il_smiles_train.values
+    unique_ils    = np.unique(groups)            # all unique IL SMILES in train set
+    all_rmse      = []
+    all_r2        = []
+    repeat_r2_means = []  # mean R² per repeat, for reporting trend
 
-    rmse_scores = []
-    r2_scores   = []
+    print(f"[cv] {model_name}: {CV_REPEATS} repeats x {CV_FOLDS} folds = "
+          f"{CV_REPEATS * CV_FOLDS} total evaluations")
 
-    # Manual loop because GroupKFold requires explicit groups -- can't use cross_val_score
-    for fold_idx, (train_idx, val_idx) in enumerate(group_kfold.split(X_train, y_train, groups)):
-        X_fold_train, X_fold_val = X_train[train_idx], X_train[val_idx]
-        y_fold_train, y_fold_val = y_train[train_idx], y_train[val_idx]
+    for repeat_idx in range(CV_REPEATS):
+        repeat_seed = RANDOM_SEED + repeat_idx  # different seed per repeat
 
-        model.fit(X_fold_train, y_fold_train)
-        y_fold_pred = model.predict(X_fold_val)
+        # Shuffle the unique ILs with this repeat's seed, then re-map to row indices.
+        # This changes which ILs fall into which fold without changing the training data.
+        shuffled_ils = shuffle(unique_ils, random_state=repeat_seed)
 
-        fold_rmse = np.sqrt(mean_squared_error(y_fold_val, y_fold_pred))
-        fold_r2   = r2_score(y_fold_val, y_fold_pred)
-        rmse_scores.append(fold_rmse)
-        r2_scores.append(fold_r2)
+        # Build a new group array where each IL gets a fold assignment based on
+        # its position in the shuffled list. This is equivalent to GroupKFold
+        # on a freshly shuffled IL ordering.
+        il_to_fold = {il: i % CV_FOLDS for i, il in enumerate(shuffled_ils)}
+        fold_assignment = np.array([il_to_fold[il] for il in groups])
 
-        # Count unique ILs in val fold to show the grouping is working
-        n_val_ils = len(np.unique(groups[val_idx]))
-        print(f"    Fold {fold_idx+1}: {n_val_ils} ILs in val | RMSE={fold_rmse:.4f} | R²={fold_r2:.4f}")
+        repeat_rmse = []
+        repeat_r2   = []
 
-    rmse_arr = np.array(rmse_scores)
-    r2_arr   = np.array(r2_scores)
+        for fold_idx in range(CV_FOLDS):
+            # Val = rows where this IL is assigned to this fold
+            val_mask   = fold_assignment == fold_idx
+            train_mask = ~val_mask
 
-    print(f"\n[cross_validate] {model_name} (GroupKFold, grouped by IL):")
+            X_fold_train = X_train[train_mask]
+            y_fold_train = y_train[train_mask]
+            X_fold_val   = X_train[val_mask]
+            y_fold_val   = y_train[val_mask]
+
+            # Verify no IL overlap between fold train and val
+            train_ils_fold = set(groups[train_mask])
+            val_ils_fold   = set(groups[val_mask])
+            assert len(train_ils_fold & val_ils_fold) == 0, "IL overlap in fold!"
+
+            model.fit(X_fold_train, y_fold_train)
+            y_fold_pred = model.predict(X_fold_val)
+
+            fold_rmse = np.sqrt(mean_squared_error(y_fold_val, y_fold_pred))
+            fold_r2   = r2_score(y_fold_val, y_fold_pred)
+            repeat_rmse.append(fold_rmse)
+            repeat_r2.append(fold_r2)
+
+        repeat_mean_r2 = np.mean(repeat_r2)
+        repeat_r2_means.append(repeat_mean_r2)
+        all_rmse.extend(repeat_rmse)
+        all_r2.extend(repeat_r2)
+
+        print(f"  Repeat {repeat_idx+1}/{CV_REPEATS}: "
+              f"mean R²={repeat_mean_r2:.4f}, "
+              f"fold R² range=[{min(repeat_r2):.3f}, {max(repeat_r2):.3f}]")
+
+    rmse_arr = np.array(all_rmse)
+    r2_arr   = np.array(all_r2)
+
+    print(f"\n[cv] {model_name} — Repeated GroupKFold ({CV_REPEATS}x{CV_FOLDS}) summary:")
     print(f"  CV RMSE  (log10 x2): {rmse_arr.mean():.4f} +/- {rmse_arr.std():.4f}")
-    print(f"  CV R2              : {r2_arr.mean():.4f} +/- {r2_arr.std():.4f}")
-    print(f"  NOTE: GroupKFold CV is stricter than plain KFold -- "
-          f"each fold's val set contains ILs never seen during that fold's training.")
+    print(f"  CV R²              : {r2_arr.mean():.4f} +/- {r2_arr.std():.4f}")
+    print(f"  Per-repeat R² means: {[f'{x:.3f}' for x in repeat_r2_means]}")
+    print(f"  NOTE: std here reflects true fold-to-fold variability across 25 evaluations,")
+    print(f"  not just one lucky/unlucky 5-fold split. This is the honest CV estimate.")
 
     return {
-        "model":        model_name,
-        "cv_rmse_mean": rmse_arr.mean(),
-        "cv_rmse_std":  rmse_arr.std(),
-        "cv_r2_mean":   r2_arr.mean(),
-        "cv_r2_std":    r2_arr.std(),
-        "cv_protocol":  "GroupKFold(il_smiles)",  # document the protocol used
+        "model":           model_name,
+        "cv_rmse_mean":    float(rmse_arr.mean()),
+        "cv_rmse_std":     float(rmse_arr.std()),
+        "cv_r2_mean":      float(r2_arr.mean()),
+        "cv_r2_std":       float(r2_arr.std()),
+        "cv_protocol":     f"RepeatedGroupKFold({CV_REPEATS}x{CV_FOLDS}, grouped by il_smiles)",
+        "n_cv_evaluations": CV_FOLDS * CV_REPEATS,
     }
 
 
@@ -197,7 +242,7 @@ def evaluate_on_test(model, X_test: np.ndarray, y_test: np.ndarray,
     r2   = r2_score(y_test, y_pred)
     mae  = mean_absolute_error(y_test, y_pred)
 
-    x2_true = 10 ** y_test    # back-transform from log10 to mole fraction
+    x2_true = 10 ** y_test
     x2_pred = 10 ** y_pred
     x2_rmse = np.sqrt(mean_squared_error(x2_true, x2_pred))
 
@@ -211,7 +256,7 @@ def evaluate_on_test(model, X_test: np.ndarray, y_test: np.ndarray,
         "il_smiles":    il_smiles_test.values,
         "y_true_log":   y_test,
         "y_pred_log":   y_pred,
-        "residual_log": y_pred - y_test,   # positive = model overpredicted
+        "residual_log": y_pred - y_test,
         "x2_true":      x2_true,
         "x2_pred":      x2_pred,
     })
@@ -232,7 +277,6 @@ def get_feature_importances(model, feature_cols: list, model_name: str,
     Extract and rank feature importances from a fitted tree-based model.
 
     RF uses mean decrease in impurity; XGBoost uses gain.
-    Both reflect how much each feature reduces prediction error across all trees.
     The appearance of T_K / P_kPa near the top is expected and physically meaningful.
     """
     importance_df = pd.DataFrame({
@@ -248,7 +292,7 @@ def get_feature_importances(model, feature_cols: list, model_name: str,
 
 def main():
     """
-    Main pipeline: load -> cross-validate (GroupKFold) -> fit -> test evaluation -> save.
+    Main pipeline: load -> repeated GroupKFold CV -> fit -> test evaluation -> save.
     """
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -261,11 +305,6 @@ def main():
     print(f"\n[main] {X_train.shape[1]} total features | "
           f"{X_train.shape[0]} train rows ({n_unique_train_ils} unique ILs) | "
           f"{X_test.shape[0]} test rows")
-
-    # Warn if too few ILs for GroupKFold -- each fold needs at least 1 IL
-    if n_unique_train_ils < CV_FOLDS * 2:
-        print(f"[main] WARNING: only {n_unique_train_ils} unique ILs in train set -- "
-              f"GroupKFold with {CV_FOLDS} folds may have very uneven folds.")
 
     # -- Step 2: Define models -----------------------------------------------
     random_forest = RandomForestRegressor(
@@ -291,14 +330,14 @@ def main():
         "XGBoost":      xgboost_model,
     }
 
-    # -- Step 3: Cross-validate on training set (GroupKFold) ----------------
-    print("\n=== CROSS-VALIDATION (train set, 5-fold GroupKFold by IL) ===")
-    print("[main] Using GroupKFold -- each val fold contains ILs absent from train.")
-    print("[main] This gives a realistic estimate of generalization to novel ILs.\n")
+    # -- Step 3: Repeated GroupKFold CV --------------------------------------
+    print(f"\n=== CROSS-VALIDATION ({CV_REPEATS}x{CV_FOLDS} Repeated GroupKFold by IL) ===")
+    print("[main] Each repeat uses a different random IL-to-fold assignment.")
+    print("[main] This averages out variance from unlucky fold composition.\n")
     cv_results = []
     for name, model in models.items():
         print(f"--- {name} ---")
-        cv_result = cross_validate_model(model, X_train, y_train, il_smiles_train, name)
+        cv_result = repeated_group_kfold_cv(model, X_train, y_train, il_smiles_train, name)
         cv_results.append(cv_result)
 
     pd.DataFrame(cv_results).to_csv(
@@ -337,16 +376,13 @@ def main():
 
     print(f"\n[main] Best model: {best_name}  (R2 = {best_r2:.4f}, RMSE = {best_rmse:.4f})")
 
-    # Save model + feature_cols together so inverse_design.py can align columns.
-    # WHY: XGBoost trained on numpy arrays does not store feature names internally.
-    # Without feature_cols, inverse_design.py cannot detect column order mismatches.
     model_bundle = {
         "model":        best_model,
-        "feature_cols": feature_cols,   # exact list of column names in training order
+        "feature_cols": feature_cols,
         "model_name":   best_name,
     }
     joblib.dump(model_bundle, MODEL_PATH)
-    print(f"[main] Model bundle (model + feature_cols) saved -> {MODEL_PATH}")
+    print(f"[main] Model bundle saved -> {MODEL_PATH}")
 
     with open(os.path.join(MODEL_DIR, "best_model_name.txt"), "w") as f:
         f.write(best_name)
@@ -367,15 +403,18 @@ def main():
     print("  models/best_model_name.txt")
 
     # -- Final diagnostic ----------------------------------------------------
+    cv_xgb = next((r for r in cv_results if r["model"] == "XGBoost"), None)
     if best_r2 < 0.5:
-        print(f"\nWARNING: Best R2 = {best_r2:.4f} -- still below 0.5.")
-        print("   Next steps: run src/tune_hyperparameters.py or check T/P coverage.")
-        print("   Check P_kPa coverage: python -c \"import pandas as pd; "
-              "print(pd.read_csv('data/processed/train_set.csv')[['T_K','P_kPa']].describe())\"")
+        print(f"\nWARNING: Best R2 = {best_r2:.4f} -- below 0.5.")
+        print("   Run src/tune_hyperparameters.py or check T/P coverage.")
     else:
         print(f"\nModel R2 = {best_r2:.4f}. Phase 3 complete.")
+        if cv_xgb:
+            print(f"  Repeated GroupKFold CV R² = {cv_xgb['cv_r2_mean']:.3f} "
+                  f"+/- {cv_xgb['cv_r2_std']:.3f}  "
+                  f"({cv_xgb['n_cv_evaluations']} evaluations)")
         print("  Next: run src/tune_hyperparameters.py, src/predict_with_uncertainty.py,")
-        print("        or src/applicability_domain.py for robustness improvements.")
+        print("        src/applicability_domain.py, src/plot_tp_residuals.py")
 
 
 if __name__ == "__main__":
