@@ -14,14 +14,22 @@ WHY T_K AND P_kPa ARE INCLUDED AS FEATURES:
   For competition framing: "Our model predicts CO2 solubility given the IL structure,
   temperature, and pressure -- mirroring real industrial process conditions."
 
+CROSS-VALIDATION STRATEGY — GroupKFold:
+  We use GroupKFold (grouped by il_smiles) instead of plain KFold.
+  WHY THIS MATTERS: Plain KFold can put measurements of the SAME IL in both
+  training and validation folds. Since one IL can appear at many (T, P) conditions,
+  this leaks structural information from train into val -- the CV score looks
+  artificially better than generalization to new ILs actually is.
+  GroupKFold ensures every fold's validation set contains ONLY ILs not seen in
+  that fold's training set, giving a fair estimate of performance on novel ILs.
+  This is the correct protocol for IL property prediction (Sistla et al. 2023).
+
 WHAT EACH STEP PRODUCES:
   1. Cross-validation results on train set → results/cv_results.csv
   2. Test set evaluation (RMSE, R², MAE)  → results/model_performance.csv
   3. Predicted vs actual values on test   → results/test_predictions.csv
   4. Feature importances (top 30)         → results/feature_importances.csv
   5. Best model + feature_cols saved      → models/forward_model.pkl
-     (feature_cols are saved inside the pkl so inverse_design.py can align
-      the virtual library to the exact same column order used during training)
 
 INPUTS:
   data/processed/train_set.csv   (from build_dataset.py)
@@ -37,7 +45,7 @@ import pandas as pd
 import joblib
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
-from sklearn.model_selection import cross_val_score, KFold
+from sklearn.model_selection import cross_val_score, GroupKFold
 from xgboost import XGBRegressor
 
 # -- Constants -----------------------------------------------------------------
@@ -69,7 +77,8 @@ def load_split(path: str, label: str) -> tuple:
     """
     Load a train or test CSV and build the feature matrix X and target vector y.
 
-    Features = Morgan fingerprint bits (cat_* / an_*) + RDKit descriptors + T_K + P_kPa.
+    Features = Morgan fingerprint bits (cat_fp_* / an_fp_*) + RDKit descriptors
+    (cat_mol_weight, cat_num_hbd, etc.) + T_K + P_kPa.
     Target   = log10(x2_CO2).
 
     Returns X (numpy array), y (numpy array), il_smiles (Series), feature_cols (list).
@@ -80,8 +89,17 @@ def load_split(path: str, label: str) -> tuple:
     df = pd.read_csv(path)
     print(f"[load_split] {label}: {df.shape[0]} rows x {df.shape[1]} cols")
 
-    # Molecular structure features (Morgan FP bits + RDKit descriptors)
+    # Molecular structure features: Morgan FP bits (cat_fp_*, an_fp_*) AND
+    # RDKit physicochemical descriptors (cat_mol_weight, an_num_hbd, etc.)
+    # Both are prefixed cat_ or an_ in featurize.py.
     molecular_cols = [c for c in df.columns if c.startswith("cat_") or c.startswith("an_")]
+
+    # Count FP bits vs descriptors for transparency
+    fp_cols   = [c for c in molecular_cols if "_fp_" in c]
+    desc_cols = [c for c in molecular_cols if "_fp_" not in c]
+    print(f"[load_split] {label}: {len(fp_cols)} Morgan FP bits + "
+          f"{len(desc_cols)} RDKit descriptors + {len(CONDITION_FEATURES)} T/P = "
+          f"{len(molecular_cols) + len(CONDITION_FEATURES)} total features")
 
     # Verify condition columns exist before proceeding
     missing_conditions = [c for c in CONDITION_FEATURES if c not in df.columns]
@@ -92,12 +110,10 @@ def load_split(path: str, label: str) -> tuple:
         )
 
     feature_cols = molecular_cols + CONDITION_FEATURES  # structure + T + P
-    print(f"[load_split] {label}: {len(molecular_cols)} molecular features "
-          f"+ {len(CONDITION_FEATURES)} condition features = {len(feature_cols)} total")
     print(f"[load_split] {label}: target range "
           f"[{df[TARGET_COL].min():.2f}, {df[TARGET_COL].max():.2f}]")
 
-    # Warn if any condition values are missing -- NaN rows would cause silent issues
+    # Warn if any condition values are missing -- NaN rows cause silent errors
     n_missing_t = df["T_K"].isna().sum()
     n_missing_p = df["P_kPa"].isna().sum()
     if n_missing_t > 0 or n_missing_p > 0:
@@ -107,38 +123,63 @@ def load_split(path: str, label: str) -> tuple:
 
     X         = df[feature_cols].values
     y         = df[TARGET_COL].values
-    il_smiles = df["il_smiles"]
+    il_smiles = df["il_smiles"]  # used as group label in GroupKFold CV
     return X, y, il_smiles, feature_cols
 
 
 def cross_validate_model(model, X_train: np.ndarray, y_train: np.ndarray,
-                         model_name: str) -> dict:
+                         il_smiles_train: pd.Series, model_name: str) -> dict:
     """
-    Run 5-fold cross-validation on the training set, reporting mean +/- std RMSE and R².
+    Run 5-fold cross-validation on the training set using GroupKFold.
 
-    Plain KFold (not GroupKFold) is used here: CV is for hyperparameter sanity-checking.
-    The authoritative generalization estimate is the held-out test set, which was already
-    split by IL identity (no IL overlap) in build_dataset.py.
+    GroupKFold groups rows by il_smiles so that all measurements from
+    the same IL go into the same fold. This prevents data leakage: without
+    grouping, the same IL measured at 10 temperatures could appear in both
+    train and val, making CV scores optimistically biased.
+
+    The CV RMSE here reflects true generalization to new ILs -- a harder and
+    more honest metric than plain KFold would give.
     """
-    kfold = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+    # GroupKFold requires groups: same IL always in same fold
+    group_kfold = GroupKFold(n_splits=CV_FOLDS)
+    groups = il_smiles_train.values  # one group label per row
 
-    rmse_scores = -cross_val_score(model, X_train, y_train,
-                                   cv=kfold, scoring="neg_root_mean_squared_error",
-                                   n_jobs=-1)
-    r2_scores   =  cross_val_score(model, X_train, y_train,
-                                   cv=kfold, scoring="r2",
-                                   n_jobs=-1)
+    rmse_scores = []
+    r2_scores   = []
 
-    print(f"\n[cross_validate] {model_name}:")
-    print(f"  CV RMSE  (log10 x2): {rmse_scores.mean():.4f} +/- {rmse_scores.std():.4f}")
-    print(f"  CV R2              : {r2_scores.mean():.4f} +/- {r2_scores.std():.4f}")
+    # Manual loop because GroupKFold requires explicit groups -- can't use cross_val_score
+    for fold_idx, (train_idx, val_idx) in enumerate(group_kfold.split(X_train, y_train, groups)):
+        X_fold_train, X_fold_val = X_train[train_idx], X_train[val_idx]
+        y_fold_train, y_fold_val = y_train[train_idx], y_train[val_idx]
+
+        model.fit(X_fold_train, y_fold_train)
+        y_fold_pred = model.predict(X_fold_val)
+
+        fold_rmse = np.sqrt(mean_squared_error(y_fold_val, y_fold_pred))
+        fold_r2   = r2_score(y_fold_val, y_fold_pred)
+        rmse_scores.append(fold_rmse)
+        r2_scores.append(fold_r2)
+
+        # Count unique ILs in val fold to show the grouping is working
+        n_val_ils = len(np.unique(groups[val_idx]))
+        print(f"    Fold {fold_idx+1}: {n_val_ils} ILs in val | RMSE={fold_rmse:.4f} | R²={fold_r2:.4f}")
+
+    rmse_arr = np.array(rmse_scores)
+    r2_arr   = np.array(r2_scores)
+
+    print(f"\n[cross_validate] {model_name} (GroupKFold, grouped by IL):")
+    print(f"  CV RMSE  (log10 x2): {rmse_arr.mean():.4f} +/- {rmse_arr.std():.4f}")
+    print(f"  CV R2              : {r2_arr.mean():.4f} +/- {r2_arr.std():.4f}")
+    print(f"  NOTE: GroupKFold CV is stricter than plain KFold -- "
+          f"each fold's val set contains ILs never seen during that fold's training.")
 
     return {
         "model":        model_name,
-        "cv_rmse_mean": rmse_scores.mean(),
-        "cv_rmse_std":  rmse_scores.std(),
-        "cv_r2_mean":   r2_scores.mean(),
-        "cv_r2_std":    r2_scores.std(),
+        "cv_rmse_mean": rmse_arr.mean(),
+        "cv_rmse_std":  rmse_arr.std(),
+        "cv_r2_mean":   r2_arr.mean(),
+        "cv_r2_std":    r2_arr.std(),
+        "cv_protocol":  "GroupKFold(il_smiles)",  # document the protocol used
     }
 
 
@@ -207,17 +248,24 @@ def get_feature_importances(model, feature_cols: list, model_name: str,
 
 def main():
     """
-    Main pipeline: load -> cross-validate -> fit -> test evaluation -> save.
+    Main pipeline: load -> cross-validate (GroupKFold) -> fit -> test evaluation -> save.
     """
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     # -- Step 1: Load data ---------------------------------------------------
-    X_train, y_train, _, feature_cols       = load_split(TRAIN_CSV, "Train")
-    X_test,  y_test,  il_smiles_test, _     = load_split(TEST_CSV,  "Test")
+    X_train, y_train, il_smiles_train, feature_cols = load_split(TRAIN_CSV, "Train")
+    X_test,  y_test,  il_smiles_test,  _            = load_split(TEST_CSV,  "Test")
 
+    n_unique_train_ils = il_smiles_train.nunique()
     print(f"\n[main] {X_train.shape[1]} total features | "
-          f"{X_train.shape[0]} train rows | {X_test.shape[0]} test rows")
+          f"{X_train.shape[0]} train rows ({n_unique_train_ils} unique ILs) | "
+          f"{X_test.shape[0]} test rows")
+
+    # Warn if too few ILs for GroupKFold -- each fold needs at least 1 IL
+    if n_unique_train_ils < CV_FOLDS * 2:
+        print(f"[main] WARNING: only {n_unique_train_ils} unique ILs in train set -- "
+              f"GroupKFold with {CV_FOLDS} folds may have very uneven folds.")
 
     # -- Step 2: Define models -----------------------------------------------
     random_forest = RandomForestRegressor(
@@ -243,11 +291,14 @@ def main():
         "XGBoost":      xgboost_model,
     }
 
-    # -- Step 3: Cross-validate on training set ------------------------------
-    print("\n=== CROSS-VALIDATION (train set, 5-fold) ===")
+    # -- Step 3: Cross-validate on training set (GroupKFold) ----------------
+    print("\n=== CROSS-VALIDATION (train set, 5-fold GroupKFold by IL) ===")
+    print("[main] Using GroupKFold -- each val fold contains ILs absent from train.")
+    print("[main] This gives a realistic estimate of generalization to novel ILs.\n")
     cv_results = []
     for name, model in models.items():
-        cv_result = cross_validate_model(model, X_train, y_train, name)
+        print(f"--- {name} ---")
+        cv_result = cross_validate_model(model, X_train, y_train, il_smiles_train, name)
         cv_results.append(cv_result)
 
     pd.DataFrame(cv_results).to_csv(
@@ -318,11 +369,13 @@ def main():
     # -- Final diagnostic ----------------------------------------------------
     if best_r2 < 0.5:
         print(f"\nWARNING: Best R2 = {best_r2:.4f} -- still below 0.5.")
+        print("   Next steps: run src/tune_hyperparameters.py or check T/P coverage.")
         print("   Check P_kPa coverage: python -c \"import pandas as pd; "
               "print(pd.read_csv('data/processed/train_set.csv')[['T_K','P_kPa']].describe())\"")
     else:
         print(f"\nModel R2 = {best_r2:.4f}. Phase 3 complete.")
-        print("  Ready for src/plot_results.py (figures) or Phase 4 inverse design.")
+        print("  Next: run src/tune_hyperparameters.py, src/predict_with_uncertainty.py,")
+        print("        or src/applicability_domain.py for robustness improvements.")
 
 
 if __name__ == "__main__":
