@@ -19,12 +19,20 @@ LOG TRANSFORM:
   more evenly and makes the regression task easier for tree-based models.
   We inverse-transform (10^y) predictions before reporting results.
 
+MISSING P_kPa HANDLING:
+  A small number of ILThermo entries report x2 without a pressure value (typically
+  measurements implicitly assumed to be at atmospheric pressure ~101.325 kPa).
+  We drop these rows rather than imputing, because:
+    1. P_kPa is a strong predictor (Henry's law: x2 ∝ P); imputing wrongly biases predictions.
+    2. 65 rows out of ~9000 is <1% of the dataset — negligible data loss.
+  The affected ILs are reported so they can be manually checked against ILThermo.
+
 INPUT:
   data/raw/ilthermo_mole_fraction_datapoints.csv  (from fetch_datapoints.py)
   data/processed/il_features.csv                  (from featurize.py)
 
 OUTPUT:
-  data/processed/ml_dataset.csv          — full merged dataset
+  data/processed/ml_dataset.csv          — full merged dataset (NaN-clean)
   data/processed/train_set.csv           — training rows (80% of ILs)
   data/processed/test_set.csv            — held-out test rows (20% of ILs)
   results/dataset_summary.csv            — statistics for the paper
@@ -54,6 +62,9 @@ RANDOM_SEED     = 42     # fixed seed for reproducibility
 TARGET_COL      = "log_x2_CO2"   # ML target (log-transformed)
 RAW_TARGET_COL  = "x2_CO2"       # original measurement
 
+# Condition columns that must be non-null for a row to be usable
+REQUIRED_CONDITION_COLS = ["T_K", "P_kPa"]
+
 
 def load_csv(path: str, label: str) -> pd.DataFrame:
     """Load a CSV and print its shape. Raises if missing."""
@@ -62,6 +73,50 @@ def load_csv(path: str, label: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     print(f"[load] {label}: {df.shape[0]} rows × {df.shape[1]} cols")
     return df
+
+
+def drop_missing_conditions(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop rows where T_K or P_kPa is missing.
+
+    These rows cannot be used for training or evaluation because T and P are
+    required model inputs. XGBoost handles NaN internally via learned split
+    directions, but this is not principled for physical features with known
+    causal roles (Henry's law). We prefer to drop the 65 affected rows (<1%)
+    and report which ILs are affected for transparency.
+
+    If an IL loses ALL its rows here, it will be absent from training entirely.
+    That IL is reported separately so it can be manually investigated.
+    """
+    before = len(df)
+    # Find which ILs are affected before dropping
+    affected_mask = df[REQUIRED_CONDITION_COLS].isna().any(axis=1)
+    affected_ils  = df.loc[affected_mask, "il_name"].unique().tolist()
+
+    df_clean = df.dropna(subset=REQUIRED_CONDITION_COLS).copy()
+    dropped  = before - len(df_clean)
+
+    if dropped > 0:
+        # DATA QUALITY FLAG: document exactly what was removed and why
+        print(f"[drop_missing_conditions] Dropped {dropped} rows with missing T_K or P_kPa")
+        print(f"  Affected ILs ({len(affected_ils)}): {affected_ils[:10]}"
+              f"{'...' if len(affected_ils) > 10 else ''}")
+        print(f"  Rationale: T and P are causal predictors (Henry's law); "
+              f"imputing would introduce systematic bias.")
+        print(f"  Data loss: {dropped}/{before} = {100*dropped/before:.1f}% of rows")
+
+        # Warn if any IL lost all its rows (would vanish from training)
+        ils_after  = set(df_clean["il_name"].unique())
+        ils_before = set(df["il_name"].unique())
+        fully_lost = ils_before - ils_after
+        if fully_lost:
+            print(f"  WARNING: {len(fully_lost)} IL(s) lost ALL rows and will be absent from training:")
+            for il in sorted(fully_lost):
+                print(f"    - {il}")
+    else:
+        print(f"[drop_missing_conditions] No missing T_K or P_kPa — all rows clean.")
+
+    return df_clean
 
 
 def add_log_target(df: pd.DataFrame) -> pd.DataFrame:
@@ -173,6 +228,8 @@ def generate_summary(merged_df: pd.DataFrame,
         {"metric": "unique_ILs",              "value": int(merged_df["il_name"].nunique())},
         {"metric": "T_K_min",                 "value": float(merged_df["T_K"].min())},
         {"metric": "T_K_max",                 "value": float(merged_df["T_K"].max())},
+        {"metric": "P_kPa_min",               "value": float(merged_df["P_kPa"].min())},
+        {"metric": "P_kPa_max",               "value": float(merged_df["P_kPa"].max())},
         {"metric": "x2_CO2_min",              "value": float(merged_df["x2_CO2"].min())},
         {"metric": "x2_CO2_max",              "value": float(merged_df["x2_CO2"].max())},
         {"metric": "log_x2_mean",             "value": float(merged_df[TARGET_COL].mean())},
@@ -191,10 +248,13 @@ def generate_summary(merged_df: pd.DataFrame,
 
 
 def main():
-    """Main: load → log-transform → merge features → stratified split → save all."""
+    """Main: load → drop NaN conditions → log-transform → merge features → split → save."""
     datapoints_df = load_csv(DATAPOINTS_CSV, "Datapoints")
     features_df   = load_csv(FEATURES_CSV,   "Features")
 
+    # Drop rows with missing T_K or P_kPa BEFORE log-transform and merge
+    # so the row count printed by add_log_target reflects only usable rows
+    datapoints_df = drop_missing_conditions(datapoints_df)
     datapoints_df = add_log_target(datapoints_df)
     merged_df     = merge_features(datapoints_df, features_df)
     train_df, test_df = stratified_il_split(merged_df)
