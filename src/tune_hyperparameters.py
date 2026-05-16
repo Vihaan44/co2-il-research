@@ -34,22 +34,26 @@ Run from project root:
 """
 
 import os
+import sys
 import numpy as np
 import pandas as pd
 import joblib
 import optuna
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import GroupKFold
 from xgboost import XGBRegressor
+
+# Force stdout to flush immediately -- required for nohup log visibility
+sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)
 
 # Suppress Optuna's verbose per-trial logging -- we print our own summaries
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # -- Constants -----------------------------------------------------------------
-TRAIN_CSV   = os.path.join("data", "processed", "train_set.csv")
-MODEL_DIR   = "models"
-RESULTS_DIR = "results"
+TRAIN_CSV        = os.path.join("data", "processed", "train_set.csv")
+MODEL_DIR        = "models"
+RESULTS_DIR      = "results"
 TUNED_MODEL_PATH = os.path.join(MODEL_DIR, "forward_model_tuned.pkl")
 
 TARGET_COL         = "log_x2_CO2"
@@ -57,8 +61,7 @@ CONDITION_FEATURES = ["T_K", "P_kPa"]
 CV_FOLDS           = 5
 RANDOM_SEED        = 42
 
-# How many hyperparameter combinations Optuna will try.
-# 50 trials each is enough for this dataset size without taking too long (~5-10 min).
+# 50 trials each is enough for this dataset size (~5-10 min total)
 N_TRIALS_RF  = 50
 N_TRIALS_XGB = 50
 
@@ -73,14 +76,18 @@ def load_train_data() -> tuple:
             f"Train set not found at {TRAIN_CSV}. Run build_dataset.py first."
         )
     df = pd.read_csv(TRAIN_CSV)
-    print(f"[load_train_data] {df.shape[0]} rows, {df['il_smiles'].nunique()} unique ILs")
+    print(f"[load_train_data] {df.shape[0]} rows, {df['il_smiles'].nunique()} unique ILs",
+          flush=True)
 
     molecular_cols = [c for c in df.columns if c.startswith("cat_") or c.startswith("an_")]
     feature_cols   = molecular_cols + CONDITION_FEATURES
 
+    # Drop NaN condition rows defensively
+    df = df.dropna(subset=CONDITION_FEATURES).copy()
+
     X         = df[feature_cols].values
     y         = df[TARGET_COL].values
-    il_smiles = df["il_smiles"]  # group label for GroupKFold
+    il_smiles = df["il_smiles"]
     return X, y, il_smiles, feature_cols
 
 
@@ -89,9 +96,9 @@ def grouped_cv_rmse(model, X: np.ndarray, y: np.ndarray,
     """
     Compute mean RMSE across GroupKFold folds.
 
-    This is the objective Optuna minimizes: we want the lowest average RMSE
-    across 5 folds where each fold's val set contains ILs not in that fold's
-    training split. Lower RMSE = better generalization to new ILs.
+    This is the objective Optuna minimizes: lowest average RMSE across 5 folds
+    where each fold's val set contains ILs not seen during that fold's training.
+    Lower RMSE = better generalization to new ILs.
     """
     group_kfold = GroupKFold(n_splits=CV_FOLDS)
     groups      = il_smiles.values
@@ -111,10 +118,7 @@ def rf_objective(trial, X: np.ndarray, y: np.ndarray,
     """
     Optuna objective for Random Forest.
     Suggests hyperparameter values and returns GroupKFold RMSE.
-    Optuna's Bayesian optimizer will use past trial results to
-    suggest better values in future trials.
     """
-    # Optuna suggests values within the ranges we specify
     n_estimators     = trial.suggest_int("n_estimators", 100, 600)
     max_features     = trial.suggest_categorical("max_features", ["sqrt", "log2", 0.3, 0.5])
     min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 10)
@@ -128,7 +132,11 @@ def rf_objective(trial, X: np.ndarray, y: np.ndarray,
         random_state     = RANDOM_SEED,
         n_jobs           = -1,
     )
-    return grouped_cv_rmse(model, X, y, il_smiles)
+    rmse = grouped_cv_rmse(model, X, y, il_smiles)
+    print(f"  Trial {trial.number:3d}: RMSE={rmse:.4f} | "
+          f"n_est={n_estimators}, max_feat={max_features}, "
+          f"min_leaf={min_samples_leaf}, max_depth={max_depth}", flush=True)
+    return rmse
 
 
 def xgb_objective(trial, X: np.ndarray, y: np.ndarray,
@@ -142,8 +150,8 @@ def xgb_objective(trial, X: np.ndarray, y: np.ndarray,
     max_depth     = trial.suggest_int("max_depth", 3, 10)
     subsample     = trial.suggest_float("subsample", 0.5, 1.0)
     colsample     = trial.suggest_float("colsample_bytree", 0.3, 1.0)
-    reg_alpha     = trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True)  # L1 regularization
-    reg_lambda    = trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True) # L2 regularization
+    reg_alpha     = trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True)
+    reg_lambda    = trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True)
 
     model = XGBRegressor(
         n_estimators     = n_estimators,
@@ -157,42 +165,42 @@ def xgb_objective(trial, X: np.ndarray, y: np.ndarray,
         n_jobs           = -1,
         verbosity        = 0,
     )
-    return grouped_cv_rmse(model, X, y, il_smiles)
+    rmse = grouped_cv_rmse(model, X, y, il_smiles)
+    print(f"  Trial {trial.number:3d}: RMSE={rmse:.4f} | "
+          f"n_est={n_estimators}, lr={learning_rate:.4f}, "
+          f"depth={max_depth}, alpha={reg_alpha:.2e}, lambda={reg_lambda:.2e}",
+          flush=True)
+    return rmse
 
 
 def run_study(model_name: str, objective_fn, n_trials: int,
-             X: np.ndarray, y: np.ndarray,
-             il_smiles: pd.Series) -> tuple:
+              X: np.ndarray, y: np.ndarray,
+              il_smiles: pd.Series) -> tuple:
     """
     Run an Optuna study for one model type.
-    Returns (best_params, trials_df) where trials_df has all trial results.
+    Returns (best_params, trials_df).
     """
-    print(f"\n[run_study] Tuning {model_name}: {n_trials} trials ...")
+    print(f"\n[run_study] Tuning {model_name}: {n_trials} trials ...", flush=True)
 
-    # Use TPE sampler: Bayesian optimizer that learns from past trials
     study = optuna.create_study(
-        direction = "minimize",  # minimize RMSE
+        direction = "minimize",
         sampler   = optuna.samplers.TPESampler(seed=RANDOM_SEED),
     )
-
-    # Lambda wraps the objective so we can pass extra args (X, y, il_smiles)
     study.optimize(
         lambda trial: objective_fn(trial, X, y, il_smiles),
         n_trials = n_trials,
-        n_jobs   = 1,  # 1 trial at a time -- avoids memory issues with RF's n_jobs=-1
+        n_jobs   = 1,
     )
 
     best_params = study.best_params
     best_rmse   = study.best_value
-    print(f"[run_study] {model_name} best CV RMSE: {best_rmse:.4f}")
-    print(f"[run_study] Best params: {best_params}")
+    print(f"\n[run_study] {model_name} best CV RMSE: {best_rmse:.4f}", flush=True)
+    print(f"[run_study] Best params: {best_params}", flush=True)
 
-    # Collect all trial results for inspection
     trials_df = pd.DataFrame([
         {"trial": t.number, "cv_rmse": t.value, **t.params}
         for t in study.trials if t.value is not None
-    ])
-    trials_df = trials_df.sort_values("cv_rmse").reset_index(drop=True)
+    ]).sort_values("cv_rmse").reset_index(drop=True)
 
     return best_params, trials_df
 
@@ -202,28 +210,25 @@ def retrain_best_model(best_params_rf: dict, best_cv_rf: float,
                        X_train: np.ndarray, y_train: np.ndarray,
                        feature_cols: list) -> tuple:
     """
-    Retrain whichever model had the better CV RMSE on the full training set.
+    Retrain whichever model had better CV RMSE on the full training set.
     Returns (best_model, model_name).
     """
     if best_cv_rf <= best_cv_xgb:
-        print(f"\n[retrain] RF wins (CV RMSE {best_cv_rf:.4f} vs XGB {best_cv_xgb:.4f})")
+        print(f"\n[retrain] RF wins (CV RMSE {best_cv_rf:.4f} vs XGB {best_cv_xgb:.4f})",
+              flush=True)
         model_name = "RandomForest_tuned"
         best_model = RandomForestRegressor(
-            **best_params_rf,
-            random_state = RANDOM_SEED,
-            n_jobs       = -1,
+            **best_params_rf, random_state=RANDOM_SEED, n_jobs=-1,
         )
     else:
-        print(f"\n[retrain] XGB wins (CV RMSE {best_cv_xgb:.4f} vs RF {best_cv_rf:.4f})")
+        print(f"\n[retrain] XGB wins (CV RMSE {best_cv_xgb:.4f} vs RF {best_cv_rf:.4f})",
+              flush=True)
         model_name = "XGBoost_tuned"
         best_model = XGBRegressor(
-            **best_params_xgb,
-            random_state = RANDOM_SEED,
-            n_jobs       = -1,
-            verbosity    = 0,
+            **best_params_xgb, random_state=RANDOM_SEED, n_jobs=-1, verbosity=0,
         )
 
-    print(f"[retrain] Fitting {model_name} on full train set ...")
+    print(f"[retrain] Fitting {model_name} on full train set ...", flush=True)
     best_model.fit(X_train, y_train)
     return best_model, model_name
 
@@ -243,7 +248,7 @@ def main():
     )
     trials_rf["model"] = "RandomForest"
     trials_rf.to_csv(os.path.join(RESULTS_DIR, "tuning_results_rf.csv"), index=False)
-    print(f"[main] RF tuning results saved -> results/tuning_results_rf.csv")
+    print(f"[main] RF tuning results saved -> results/tuning_results_rf.csv", flush=True)
 
     # -- Step 3: Tune XGBoost ------------------------------------------------
     best_params_xgb, trials_xgb = run_study(
@@ -252,39 +257,31 @@ def main():
     )
     trials_xgb["model"] = "XGBoost"
     trials_xgb.to_csv(os.path.join(RESULTS_DIR, "tuning_results_xgb.csv"), index=False)
-    print(f"[main] XGB tuning results saved -> results/tuning_results_xgb.csv")
+    print(f"[main] XGB tuning results saved -> results/tuning_results_xgb.csv", flush=True)
 
-    # -- Step 4: Build best-hyperparameters summary --------------------------
-    best_cv_rf  = trials_rf.iloc[0]["cv_rmse"]   # already sorted ascending
+    # -- Step 4: Summary -----------------------------------------------------
+    best_cv_rf  = trials_rf.iloc[0]["cv_rmse"]
     best_cv_xgb = trials_xgb.iloc[0]["cv_rmse"]
 
     best_hyperparams = pd.DataFrame([
         {"model": "RandomForest", "best_cv_rmse": best_cv_rf,  **best_params_rf},
         {"model": "XGBoost",      "best_cv_rmse": best_cv_xgb, **best_params_xgb},
     ])
-    best_hyperparams.to_csv(
-        os.path.join(RESULTS_DIR, "best_hyperparams.csv"), index=False)
-    print("[main] Best hyperparams saved -> results/best_hyperparams.csv")
-    print("\n=== BEST HYPERPARAMETERS ===")
-    print(best_hyperparams.to_string(index=False))
+    best_hyperparams.to_csv(os.path.join(RESULTS_DIR, "best_hyperparams.csv"), index=False)
+    print("\n=== BEST HYPERPARAMETERS ===", flush=True)
+    print(best_hyperparams.to_string(index=False), flush=True)
 
-    # -- Step 5: Retrain winner on full training set -------------------------
+    # -- Step 5: Retrain winner ----------------------------------------------
     best_model, model_name = retrain_best_model(
         best_params_rf, best_cv_rf,
         best_params_xgb, best_cv_xgb,
         X_train, y_train, feature_cols
     )
 
-    model_bundle = {
-        "model":        best_model,
-        "feature_cols": feature_cols,
-        "model_name":   model_name,
-    }
-    joblib.dump(model_bundle, TUNED_MODEL_PATH)
-    print(f"[main] Tuned model saved -> {TUNED_MODEL_PATH}")
-    print("\n[main] DONE. To use the tuned model in inverse design:")
-    print("  Edit inverse_design.py MODEL_PATH to point at models/forward_model_tuned.pkl")
-    print("  Or rename it: mv models/forward_model_tuned.pkl models/forward_model.pkl")
+    joblib.dump({"model": best_model, "feature_cols": feature_cols,
+                 "model_name": model_name}, TUNED_MODEL_PATH)
+    print(f"[main] Tuned model saved -> {TUNED_MODEL_PATH}", flush=True)
+    print("[main] DONE.", flush=True)
 
 
 if __name__ == "__main__":
