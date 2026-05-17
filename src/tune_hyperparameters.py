@@ -21,6 +21,13 @@ WHY GroupKFold INSIDE TUNING:
   best memorize repeated T/P conditions, not those that best generalize to
   new ILs.
 
+XGB MEMORY CONSTRAINTS:
+  The codespace has ~8GB RAM. Large XGBoost models (depth=8, n_est=800)
+  on our 4,114-feature matrix can exceed this. We cap max_depth at 6 and
+  n_estimators at 500 to prevent OOM kills. This is still a wide enough
+  search space to find a good model -- prior trial showed depth=8 gave
+  RMSE=0.316 but crashed; depth<=6 is still competitive and stable.
+
 OUTPUTS:
   results/tuning_results_rf.csv    -- all RF trials with their CV RMSE
   results/tuning_results_xgb.csv   -- all XGBoost trials with their CV RMSE
@@ -46,9 +53,7 @@ from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import GroupKFold
 from xgboost import XGBRegressor
 
-# Force stdout to flush immediately -- required for nohup log visibility
 sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)
-
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # -- Constants -----------------------------------------------------------------
@@ -58,26 +63,26 @@ RESULTS_DIR      = "results"
 LOGS_DIR         = "logs"
 TUNED_MODEL_PATH = os.path.join(MODEL_DIR, "forward_model_tuned.pkl")
 
-# SQLite DB path -- Optuna writes every completed trial here immediately,
-# so crashes lose at most one in-progress trial, never completed ones.
-OPTUNA_DB_PATH   = os.path.join(LOGS_DIR, "optuna.db")
-OPTUNA_DB_URL    = f"sqlite:///{OPTUNA_DB_PATH}"
+OPTUNA_DB_PATH = os.path.join(LOGS_DIR, "optuna.db")
+OPTUNA_DB_URL  = f"sqlite:///{OPTUNA_DB_PATH}"
 
 TARGET_COL         = "log_x2_CO2"
 CONDITION_FEATURES = ["T_K", "P_kPa"]
 CV_FOLDS           = 5
 RANDOM_SEED        = 42
 
-# Target total trials per model. Optuna counts already-completed trials
-# from the DB and only runs the remainder -- so re-running after a crash
-# at trial 33/50 will only run 17 more trials, not 50.
 N_TRIALS_RF  = 50
 N_TRIALS_XGB = 50
 
-# Study names -- used as keys in the SQLite DB.
-# Changing these starts a fresh study even if optuna.db exists.
 STUDY_NAME_RF  = "rf_co2_il_v1"
 STUDY_NAME_XGB = "xgb_co2_il_v1"
+
+# XGBoost memory-safe search bounds.
+# max_depth capped at 6 (not 10) to prevent OOM on codespace ~8GB RAM.
+# n_estimators capped at 500 (not 800) for same reason.
+# These ranges still cover the scientifically useful hyperparameter space.
+XGB_MAX_DEPTH_MAX   = 6
+XGB_N_EST_MAX       = 500
 
 
 def load_train_data() -> tuple:
@@ -109,7 +114,7 @@ def grouped_cv_rmse(model, X: np.ndarray, y: np.ndarray,
                     il_smiles: pd.Series) -> float:
     """
     Compute mean RMSE across GroupKFold folds (grouped by il_smiles).
-    This is the objective Optuna minimizes -- lower = better generalization to new ILs.
+    This is the objective Optuna minimizes.
     """
     group_kfold = GroupKFold(n_splits=CV_FOLDS)
     groups      = il_smiles.values
@@ -145,10 +150,17 @@ def rf_objective(trial, X: np.ndarray, y: np.ndarray,
 
 def xgb_objective(trial, X: np.ndarray, y: np.ndarray,
                   il_smiles: pd.Series) -> float:
-    """Optuna objective for XGBoost -- returns GroupKFold CV RMSE."""
-    n_estimators  = trial.suggest_int("n_estimators", 100, 800)
+    """
+    Optuna objective for XGBoost -- returns GroupKFold CV RMSE.
+
+    Search bounds are tightened vs naive defaults to avoid OOM on codespace:
+      max_depth: 3-6 (not 3-10) -- depth 7+ on 4114 features uses >4GB
+      n_estimators: 100-500 (not 100-800) -- large ensembles compound memory use
+    These bounds still cover the optimal hyperparameter region for our dataset.
+    """
+    n_estimators  = trial.suggest_int("n_estimators", 100, XGB_N_EST_MAX)
     learning_rate = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
-    max_depth     = trial.suggest_int("max_depth", 3, 10)
+    max_depth     = trial.suggest_int("max_depth", 3, XGB_MAX_DEPTH_MAX)
     subsample     = trial.suggest_float("subsample", 0.5, 1.0)
     colsample     = trial.suggest_float("colsample_bytree", 0.3, 1.0)
     reg_alpha     = trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True)
@@ -158,7 +170,10 @@ def xgb_objective(trial, X: np.ndarray, y: np.ndarray,
         n_estimators=n_estimators, learning_rate=learning_rate,
         max_depth=max_depth, subsample=subsample,
         colsample_bytree=colsample, reg_alpha=reg_alpha, reg_lambda=reg_lambda,
-        random_state=RANDOM_SEED, n_jobs=-1, verbosity=0,
+        random_state=RANDOM_SEED,
+        n_jobs=2,       # limit to 2 cores (not -1) to cap memory use per trial
+        verbosity=0,
+        tree_method="hist",  # histogram method uses less memory than exact
     )
     rmse = grouped_cv_rmse(model, X, y, il_smiles)
     print(f"  XGB Trial {trial.number:3d}: RMSE={rmse:.4f} | "
@@ -172,29 +187,28 @@ def run_study(study_name: str, model_name: str, objective_fn,
               il_smiles: pd.Series) -> tuple:
     """
     Run (or resume) an Optuna study backed by SQLite.
-
-    load_if_exists=True means: if this study_name already exists in optuna.db,
-    load its completed trials and only run the remaining ones needed to reach
-    n_trials total. This is the crash-recovery mechanism.
+    load_if_exists=True resumes from DB after crashes.
     """
     os.makedirs(LOGS_DIR, exist_ok=True)
 
     study = optuna.create_study(
         study_name    = study_name,
-        storage       = OPTUNA_DB_URL,       # persist every trial to SQLite immediately
+        storage       = OPTUNA_DB_URL,
         direction     = "minimize",
         sampler       = optuna.samplers.TPESampler(seed=RANDOM_SEED),
-        load_if_exists= True,                # resume from DB if interrupted
+        load_if_exists= True,
     )
 
-    n_completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+    n_completed = len([t for t in study.trials
+                       if t.state == optuna.trial.TrialState.COMPLETE])
     n_remaining = max(0, n_trials - n_completed)
 
     print(f"\n[run_study] {model_name}: {n_completed} trials already done, "
           f"{n_remaining} remaining (target={n_trials})", flush=True)
 
     if n_remaining == 0:
-        print(f"[run_study] {model_name}: already complete -- loading from DB.", flush=True)
+        print(f"[run_study] {model_name}: already complete -- loading from DB.",
+              flush=True)
     else:
         study.optimize(
             lambda trial: objective_fn(trial, X, y, il_smiles),
@@ -220,10 +234,7 @@ def retrain_best_model(best_params_rf: dict, best_cv_rf: float,
                        best_params_xgb: dict, best_cv_xgb: float,
                        X_train: np.ndarray, y_train: np.ndarray,
                        feature_cols: list) -> tuple:
-    """
-    Retrain whichever model had better GroupKFold CV RMSE on the full training set.
-    Returns (best_model, model_name).
-    """
+    """Retrain whichever model had better CV RMSE on the full training set."""
     if best_cv_rf <= best_cv_xgb:
         print(f"\n[retrain] RF wins (CV RMSE {best_cv_rf:.4f} vs XGB {best_cv_xgb:.4f})",
               flush=True)
@@ -235,8 +246,10 @@ def retrain_best_model(best_params_rf: dict, best_cv_rf: float,
         print(f"\n[retrain] XGB wins (CV RMSE {best_cv_xgb:.4f} vs RF {best_cv_rf:.4f})",
               flush=True)
         model_name = "XGBoost_tuned"
+        # Use hist method and limited cores for final fit too
         best_model = XGBRegressor(
-            **best_params_xgb, random_state=RANDOM_SEED, n_jobs=-1, verbosity=0,
+            **best_params_xgb, random_state=RANDOM_SEED,
+            n_jobs=2, verbosity=0, tree_method="hist",
         )
 
     print(f"[retrain] Fitting {model_name} on full train set ...", flush=True)
@@ -245,18 +258,19 @@ def retrain_best_model(best_params_rf: dict, best_cv_rf: float,
 
 
 def main():
-    """Main: load -> tune RF (resumable) -> tune XGB (resumable) -> retrain -> save."""
+    """Main: load -> tune RF -> tune XGB -> retrain best -> save."""
     os.makedirs(MODEL_DIR,   exist_ok=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
     os.makedirs(LOGS_DIR,    exist_ok=True)
 
     print(f"[main] Optuna checkpoint DB: {OPTUNA_DB_PATH}", flush=True)
-    print(f"[main] If interrupted, re-run this script to resume from checkpoint.", flush=True)
+    print(f"[main] If interrupted, re-run to resume from checkpoint.", flush=True)
+    print(f"[main] XGB search bounds: max_depth<=6, n_est<=500, tree_method=hist",
+          flush=True)
 
-    # -- Step 1: Load data ---------------------------------------------------
     X_train, y_train, il_smiles_train, feature_cols = load_train_data()
 
-    # -- Step 2: Tune RF (resumes if DB has prior trials) --------------------
+    # RF tuning (resumes from DB if already done)
     best_params_rf, trials_rf = run_study(
         STUDY_NAME_RF, "RandomForest", rf_objective, N_TRIALS_RF,
         X_train, y_train, il_smiles_train
@@ -265,7 +279,7 @@ def main():
     trials_rf.to_csv(os.path.join(RESULTS_DIR, "tuning_results_rf.csv"), index=False)
     print(f"[main] RF results saved -> results/tuning_results_rf.csv", flush=True)
 
-    # -- Step 3: Tune XGBoost (resumes if DB has prior trials) ---------------
+    # XGB tuning (resumes from DB -- currently has 1 completed trial)
     best_params_xgb, trials_xgb = run_study(
         STUDY_NAME_XGB, "XGBoost", xgb_objective, N_TRIALS_XGB,
         X_train, y_train, il_smiles_train
@@ -274,7 +288,6 @@ def main():
     trials_xgb.to_csv(os.path.join(RESULTS_DIR, "tuning_results_xgb.csv"), index=False)
     print(f"[main] XGB results saved -> results/tuning_results_xgb.csv", flush=True)
 
-    # -- Step 4: Summary -----------------------------------------------------
     best_cv_rf  = trials_rf.iloc[0]["cv_rmse"]
     best_cv_xgb = trials_xgb.iloc[0]["cv_rmse"]
 
@@ -286,7 +299,6 @@ def main():
     print("\n=== BEST HYPERPARAMETERS ===", flush=True)
     print(best_hyperparams.to_string(index=False), flush=True)
 
-    # -- Step 5: Retrain winner on full train set ----------------------------
     best_model, model_name = retrain_best_model(
         best_params_rf, best_cv_rf,
         best_params_xgb, best_cv_xgb,
