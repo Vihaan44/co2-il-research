@@ -20,16 +20,19 @@ LOG TRANSFORM:
   We inverse-transform (10^y) predictions before reporting results.
 
 MISSING P_kPa HANDLING:
-  A small number of ILThermo entries report x2 without a pressure value (typically
-  measurements implicitly assumed to be at atmospheric pressure ~101.325 kPa).
-  We drop these rows rather than imputing, because:
-    1. P_kPa is a strong predictor (Henry's law: x2 ∝ P); imputing wrongly biases predictions.
-    2. 65 rows out of ~9000 is <1% of the dataset — negligible data loss.
-  The affected ILs are reported so they can be manually checked against ILThermo.
+  A small number of entries report x2 without a pressure value.
+  We drop these rows rather than imputing, because P_kPa is a causal predictor
+  (Henry's law: x2 ∝ P) and imputing wrongly biases predictions.
+  The affected ILs are reported so they can be manually checked.
+
+DATA SOURCE:
+  DATAPOINTS_CSV now points at the merged ILThermo + ThermoML dataset
+  (211 → 299 unique ILs, 9,168 → 13,767 rows after deduplication).
+  See src/merge_thermoml_into_pipeline.py for how this was produced.
 
 INPUT:
-  data/raw/ilthermo_mole_fraction_datapoints.csv  (from fetch_datapoints.py)
-  data/processed/il_features.csv                  (from featurize.py)
+  data/raw/all_co2_datapoints_merged.csv  (ILThermo + ThermoML, from merge script)
+  data/processed/il_features.csv          (from featurize.py)
 
 OUTPUT:
   data/processed/ml_dataset.csv          — full merged dataset (NaN-clean)
@@ -49,7 +52,8 @@ import json
 from sklearn.model_selection import GroupShuffleSplit
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-DATAPOINTS_CSV  = os.path.join("data", "raw",       "ilthermo_mole_fraction_datapoints.csv")
+# UPDATED: now uses the merged ILThermo + ThermoML dataset (299 unique ILs)
+DATAPOINTS_CSV  = os.path.join("data", "raw",       "all_co2_datapoints_merged.csv")
 FEATURES_CSV    = os.path.join("data", "processed", "il_features.csv")
 ML_DATASET_CSV  = os.path.join("data", "processed", "ml_dataset.csv")
 TRAIN_CSV       = os.path.join("data", "processed", "train_set.csv")
@@ -82,35 +86,30 @@ def drop_missing_conditions(df: pd.DataFrame) -> pd.DataFrame:
     These rows cannot be used for training or evaluation because T and P are
     required model inputs. XGBoost handles NaN internally via learned split
     directions, but this is not principled for physical features with known
-    causal roles (Henry's law). We prefer to drop the 65 affected rows (<1%)
+    causal roles (Henry's law). We prefer to drop affected rows (<1%)
     and report which ILs are affected for transparency.
-
-    If an IL loses ALL its rows here, it will be absent from training entirely.
-    That IL is reported separately so it can be manually investigated.
     """
     before = len(df)
-    # Find which ILs are affected before dropping
     affected_mask = df[REQUIRED_CONDITION_COLS].isna().any(axis=1)
-    affected_ils  = df.loc[affected_mask, "il_name"].unique().tolist()
+
+    # il_name may not exist in merged CSV -- use il_smiles as fallback
+    name_col = "il_name" if "il_name" in df.columns else "il_smiles"
+    affected_ils = df.loc[affected_mask, name_col].unique().tolist()
 
     df_clean = df.dropna(subset=REQUIRED_CONDITION_COLS).copy()
     dropped  = before - len(df_clean)
 
     if dropped > 0:
-        # DATA QUALITY FLAG: document exactly what was removed and why
         print(f"[drop_missing_conditions] Dropped {dropped} rows with missing T_K or P_kPa")
         print(f"  Affected ILs ({len(affected_ils)}): {affected_ils[:10]}"
               f"{'...' if len(affected_ils) > 10 else ''}")
-        print(f"  Rationale: T and P are causal predictors (Henry's law); "
-              f"imputing would introduce systematic bias.")
         print(f"  Data loss: {dropped}/{before} = {100*dropped/before:.1f}% of rows")
 
-        # Warn if any IL lost all its rows (would vanish from training)
-        ils_after  = set(df_clean["il_name"].unique())
-        ils_before = set(df["il_name"].unique())
+        ils_after  = set(df_clean[name_col].unique())
+        ils_before = set(df[name_col].unique())
         fully_lost = ils_before - ils_after
         if fully_lost:
-            print(f"  WARNING: {len(fully_lost)} IL(s) lost ALL rows and will be absent from training:")
+            print(f"  WARNING: {len(fully_lost)} IL(s) lost ALL rows:")
             for il in sorted(fully_lost):
                 print(f"    - {il}")
     else:
@@ -124,14 +123,13 @@ def add_log_target(df: pd.DataFrame) -> pd.DataFrame:
     Add a log10-transformed CO2 mole fraction column as the ML regression target.
     Rows with x2 <= 0 are dropped (can't take log of zero/negative).
 
-    log10 chosen over ln because: log10(0.01) = -2 and log10(0.1) = -1,
+    log10 chosen over ln: log10(0.01) = -2 and log10(0.1) = -1,
     making the scale intuitive when discussing results with judges.
     """
     before = len(df)
-    df = df[df[RAW_TARGET_COL] > 0].copy()  # drop non-positive x2
+    df = df[df[RAW_TARGET_COL] > 0].copy()
     dropped = before - len(df)
     if dropped > 0:
-        # DATA QUALITY FLAG
         print(f"[add_log_target] Dropped {dropped} rows with x2_CO2 <= 0")
 
     df[TARGET_COL] = np.log10(df[RAW_TARGET_COL])
@@ -142,13 +140,14 @@ def add_log_target(df: pd.DataFrame) -> pd.DataFrame:
 
 def merge_features(datapoints_df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Join measurement rows with IL features on il_smiles (the canonical IL identity).
+    Join measurement rows with IL features on il_smiles.
     Uses inner join — rows without a matching featurized IL are dropped and reported.
 
-    We merge on SMILES not il_name because names can have inconsistent spacing/
-    capitalization across ILThermo entries. SMILES is the reliable structural key.
+    NOTE: The merged dataset contains 88 new ThermoML ILs that may not yet
+    have entries in il_features.csv. Those ILs will be dropped here with a warning.
+    Run src/featurize.py first to generate features for all 299 ILs, then
+    re-run this script to capture the full dataset.
     """
-    # Only bring feature columns across (not duplicate metadata)
     feature_cols = [c for c in features_df.columns
                     if c.startswith("cat_") or c.startswith("an_")]
     smiles_plus_features = features_df[["il_smiles"] + feature_cols]
@@ -158,9 +157,19 @@ def merge_features(datapoints_df: pd.DataFrame, features_df: pd.DataFrame) -> pd
     dropped = before - len(merged_df)
 
     if dropped > 0:
-        # DATA QUALITY FLAG: rows dropped = ILs in datapoints but not in features
         print(f"[merge_features] WARNING: {dropped} rows dropped during merge")
-        print(f"  This means some ILs have no features (likely missing/invalid SMILES).")
+        print(f"  ILs in datapoints but not in features (likely new ThermoML ILs).")
+        print(f"  Run src/featurize.py to generate features for all ILs, then re-run.")
+
+        # Show which ILs are missing features
+        merged_smiles   = set(merged_df["il_smiles"])
+        missing_smiles  = set(datapoints_df["il_smiles"]) - merged_smiles
+        name_col = "il_name" if "il_name" in datapoints_df.columns else "il_smiles"
+        missing_names = datapoints_df[
+            datapoints_df["il_smiles"].isin(missing_smiles)
+        ][name_col].unique()
+        print(f"  Missing features for {len(missing_names)} ILs: "
+              f"{list(missing_names[:5])}{'...' if len(missing_names) > 5 else ''}")
 
     print(f"[merge_features] Merged: {len(merged_df)} rows × {merged_df.shape[1]} cols")
     return merged_df
@@ -170,15 +179,12 @@ def stratified_il_split(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     """
     Split by IL identity so all rows for a given IL stay in the same split.
     Uses sklearn's GroupShuffleSplit with il_smiles as the group key.
-
-    This is the correct evaluation protocol for generalizing to novel ILs.
-    A random row split would leak IL identity into the test set and give
-    artificially high R² values.
     """
-    groups = merged_df["il_smiles"]  # group key: unique IL identity
+    groups   = merged_df["il_smiles"]
     n_unique = groups.nunique()
     print(f"\n[stratified_il_split] {n_unique} unique ILs → "
-          f"~{int(n_unique * TEST_FRACTION)} in test, ~{int(n_unique * (1-TEST_FRACTION))} in train")
+          f"~{int(n_unique * TEST_FRACTION)} in test, "
+          f"~{int(n_unique * (1-TEST_FRACTION))} in train")
 
     splitter = GroupShuffleSplit(n_splits=1, test_size=TEST_FRACTION, random_state=RANDOM_SEED)
     train_idx, test_idx = next(splitter.split(merged_df, groups=groups))
@@ -186,32 +192,29 @@ def stratified_il_split(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     train_df = merged_df.iloc[train_idx].reset_index(drop=True)
     test_df  = merged_df.iloc[test_idx].reset_index(drop=True)
 
-    # Verify zero IL overlap — this must always pass
-    train_smiles = set(train_df["il_smiles"])
-    test_smiles  = set(test_df["il_smiles"])
-    overlap = train_smiles & test_smiles
+    # Verify zero IL overlap
+    overlap = set(train_df["il_smiles"]) & set(test_df["il_smiles"])
     if overlap:
-        print(f"[ERROR] {len(overlap)} ILs appear in BOTH splits — data leakage detected!")
+        print(f"[ERROR] {len(overlap)} ILs appear in BOTH splits — data leakage!")
     else:
-        print(f"[stratified_il_split] ✓ Zero IL overlap confirmed between train and test")
+        print(f"[stratified_il_split] ✓ Zero IL overlap confirmed")
 
-    print(f"  Train: {len(train_df)} rows ({train_df['il_name'].nunique()} unique ILs)")
-    print(f"  Test : {len(test_df)} rows ({test_df['il_name'].nunique()} unique ILs)")
+    name_col = "il_name" if "il_name" in train_df.columns else "il_smiles"
+    print(f"  Train: {len(train_df)} rows ({train_df[name_col].nunique()} unique ILs)")
+    print(f"  Test : {len(test_df)} rows ({test_df[name_col].nunique()} unique ILs)")
     return train_df, test_df
 
 
 def save_split_info(train_df: pd.DataFrame, test_df: pd.DataFrame) -> None:
-    """
-    Save JSON record of which ILs are in train vs test.
-    Lets us verify reproducibility if features are ever regenerated.
-    """
+    """Save JSON record of which ILs are in train vs test."""
+    name_col = "il_name" if "il_name" in train_df.columns else "il_smiles"
     split_info = {
-        "random_seed":      RANDOM_SEED,
-        "test_fraction":    TEST_FRACTION,
-        "train_il_names":   sorted(train_df["il_name"].unique().tolist()),
-        "test_il_names":    sorted(test_df["il_name"].unique().tolist()),
-        "train_row_count":  int(len(train_df)),
-        "test_row_count":   int(len(test_df)),
+        "random_seed":     RANDOM_SEED,
+        "test_fraction":   TEST_FRACTION,
+        "train_il_names":  sorted(train_df[name_col].unique().tolist()),
+        "test_il_names":   sorted(test_df[name_col].unique().tolist()),
+        "train_row_count": int(len(train_df)),
+        "test_row_count":  int(len(test_df)),
     }
     with open(SPLIT_JSON, "w") as f:
         json.dump(split_info, f, indent=2)
@@ -222,10 +225,12 @@ def generate_summary(merged_df: pd.DataFrame,
                      train_df: pd.DataFrame,
                      test_df: pd.DataFrame) -> pd.DataFrame:
     """Generate dataset statistics table for the paper methods section."""
-    feature_dim = sum(1 for c in merged_df.columns if c.startswith("cat_") or c.startswith("an_"))
+    feature_dim = sum(1 for c in merged_df.columns
+                      if c.startswith("cat_") or c.startswith("an_"))
+    name_col = "il_name" if "il_name" in merged_df.columns else "il_smiles"
     summary_rows = [
         {"metric": "total_measurement_rows",  "value": len(merged_df)},
-        {"metric": "unique_ILs",              "value": int(merged_df["il_name"].nunique())},
+        {"metric": "unique_ILs",              "value": int(merged_df[name_col].nunique())},
         {"metric": "T_K_min",                 "value": float(merged_df["T_K"].min())},
         {"metric": "T_K_max",                 "value": float(merged_df["T_K"].max())},
         {"metric": "P_kPa_min",               "value": float(merged_df["P_kPa"].min())},
@@ -235,10 +240,11 @@ def generate_summary(merged_df: pd.DataFrame,
         {"metric": "log_x2_mean",             "value": float(merged_df[TARGET_COL].mean())},
         {"metric": "log_x2_std",              "value": float(merged_df[TARGET_COL].std())},
         {"metric": "train_rows",              "value": int(len(train_df))},
-        {"metric": "train_unique_ILs",        "value": int(train_df["il_name"].nunique())},
+        {"metric": "train_unique_ILs",        "value": int(train_df[name_col].nunique())},
         {"metric": "test_rows",               "value": int(len(test_df))},
-        {"metric": "test_unique_ILs",         "value": int(test_df["il_name"].nunique())},
+        {"metric": "test_unique_ILs",         "value": int(test_df[name_col].nunique())},
         {"metric": "feature_vector_dim",      "value": feature_dim},
+        {"metric": "data_sources",            "value": str(merged_df["data_source"].value_counts().to_dict())},
     ]
     summary_df = pd.DataFrame(summary_rows)
     print("\n── DATASET SUMMARY ──────────────────────────────────────────────────")
@@ -252,8 +258,6 @@ def main():
     datapoints_df = load_csv(DATAPOINTS_CSV, "Datapoints")
     features_df   = load_csv(FEATURES_CSV,   "Features")
 
-    # Drop rows with missing T_K or P_kPa BEFORE log-transform and merge
-    # so the row count printed by add_log_target reflects only usable rows
     datapoints_df = drop_missing_conditions(datapoints_df)
     datapoints_df = add_log_target(datapoints_df)
     merged_df     = merge_features(datapoints_df, features_df)
