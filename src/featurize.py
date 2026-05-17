@@ -23,8 +23,12 @@ WHY SEPARATE CATION/ANION:
   Treating them separately lets the model learn these independent contributions.
   This is the standard approach in IL property prediction literature.
 
-INPUT:  data/raw/ilthermo_mole_fraction_datapoints.csv  (from fetch_datapoints.py)
+INPUT:  data/raw/all_co2_datapoints_merged.csv  (ILThermo + ThermoML merged)
 OUTPUT: data/processed/il_features.csv  (one row per unique IL)
+
+NOTE: INPUT_CSV was updated from ilthermo_mole_fraction_datapoints.csv to
+      all_co2_datapoints_merged.csv so that the 88 new ThermoML ILs are
+      featurized alongside the original 211 ILThermo ILs.
 
 Run from project root:
     python src/featurize.py
@@ -40,7 +44,10 @@ from rdkit.Chem import rdFingerprintGenerator  # modern API -- replaces deprecat
 # -- Constants -----------------------------------------------------------------
 MORGAN_RADIUS  = 2      # each atom looks 2 bonds out -- standard for ML
 MORGAN_NBITS   = 2048   # fingerprint vector length
-INPUT_CSV      = os.path.join("data", "raw",       "ilthermo_mole_fraction_datapoints.csv")
+
+# UPDATED: now reads from merged ILThermo + ThermoML dataset (299 unique ILs)
+# Previously pointed at ilthermo_mole_fraction_datapoints.csv (211 ILs only)
+INPUT_CSV      = os.path.join("data", "raw",       "all_co2_datapoints_merged.csv")
 OUTPUT_CSV     = os.path.join("data", "processed", "il_features.csv")
 
 # Build the Morgan generator once at module level (requires RDKit >= 2022.03).
@@ -68,7 +75,7 @@ RDKIT_DESCRIPTORS = [
 def split_il_smiles(il_smiles: str) -> tuple[str, str]:
     """
     Split an ionic liquid SMILES into cation and anion SMILES.
-    ILs in ILThermo are stored as 'cation_smiles.anion_smiles' -- the dot
+    ILs are stored as 'cation_smiles.anion_smiles' -- the dot
     is the SMILES notation for disconnected fragments (salt).
 
     Returns (cation_smiles, anion_smiles).
@@ -173,9 +180,6 @@ def featurize_il_smiles(il_smiles: str) -> dict | None:
     Wraps featurize_one_il with a None-return contract: returns None if the
     SMILES is empty or if both cation and anion fingerprints are all-zeros
     (both ions failed to parse), so the caller can skip cleanly.
-
-    This is a named alias so that future refactoring of featurize_one_il
-    doesn't silently break inverse_design.py's import.
     """
     if not il_smiles or not isinstance(il_smiles, str):
         return None
@@ -186,7 +190,6 @@ def featurize_il_smiles(il_smiles: str) -> dict | None:
     cat_sum = sum(v for k, v in result.items() if k.startswith("cat_fp_"))
     an_sum  = sum(v for k, v in result.items() if k.startswith("an_fp_"))
     if cat_sum == 0 and an_sum == 0:
-        # DATA QUALITY FLAG: no structural bits extracted
         return None
 
     return result
@@ -199,8 +202,11 @@ def featurize_all_ils(datapoints_df: pd.DataFrame) -> pd.DataFrame:
     for the same IL that appears in multiple (T, P, x2) rows.
     Returns one row per unique IL with all feature columns.
     """
+    # il_name may not exist in merged CSV (ThermoML rows use il_name too, so it should)
+    name_col = "il_name" if "il_name" in datapoints_df.columns else "il_smiles"
+
     unique_ils = datapoints_df.drop_duplicates(subset=["il_smiles"]).copy()
-    unique_ils = unique_ils[["il_name", "il_smiles"]].reset_index(drop=True)
+    unique_ils = unique_ils[[name_col, "il_smiles"]].reset_index(drop=True)
     print(f"[featurize_all_ils] Featurizing {len(unique_ils)} unique ILs...")
 
     failed_count = 0
@@ -208,10 +214,9 @@ def featurize_all_ils(datapoints_df: pd.DataFrame) -> pd.DataFrame:
 
     for idx, row in unique_ils.iterrows():
         il_smiles = str(row["il_smiles"]) if pd.notna(row["il_smiles"]) else ""
-        il_name   = str(row["il_name"])
+        il_name   = str(row[name_col])
 
         if not il_smiles:
-            # DATA QUALITY FLAG: no SMILES for this IL -- cannot featurize
             print(f"  [DATA QUALITY] No SMILES for '{il_name}' -- skipping")
             failed_count += 1
             continue
@@ -224,7 +229,8 @@ def featurize_all_ils(datapoints_df: pd.DataFrame) -> pd.DataFrame:
             print(f"  -> {idx + 1}/{len(unique_ils)} ILs featurized")
 
     features_df = pd.DataFrame(feature_rows)
-    print(f"[featurize_all_ils] Done: {len(features_df)} ILs featurized, {failed_count} skipped")
+    print(f"[featurize_all_ils] Done: {len(features_df)} ILs featurized, "
+          f"{failed_count} skipped")
     print(f"  Feature columns: {len(features_df.columns)} total")
     return features_df
 
@@ -233,11 +239,12 @@ def main():
     """Main: load datapoints -> featurize unique ILs -> save."""
     if not os.path.exists(INPUT_CSV):
         raise FileNotFoundError(
-            f"Input not found: {INPUT_CSV}. Run src/fetch_datapoints.py first."
+            f"Input not found: {INPUT_CSV}. Run src/merge_thermoml_into_pipeline.py first."
         )
 
     datapoints_df = pd.read_csv(INPUT_CSV)
-    print(f"[main] Loaded {len(datapoints_df)} rows, {datapoints_df['il_smiles'].nunique()} unique SMILES")
+    print(f"[main] Loaded {len(datapoints_df)} rows, "
+          f"{datapoints_df['il_smiles'].nunique()} unique SMILES")
 
     features_df = featurize_all_ils(datapoints_df)
 
