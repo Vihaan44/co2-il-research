@@ -22,11 +22,23 @@ WHY GroupKFold INSIDE TUNING:
   new ILs.
 
 XGB MEMORY CONSTRAINTS:
-  The codespace has ~8GB RAM. Large XGBoost models (depth=8, n_est=800)
-  on our 4,114-feature matrix can exceed this. We cap max_depth at 6 and
-  n_estimators at 500 to prevent OOM kills. This is still a wide enough
-  search space to find a good model -- prior trial showed depth=8 gave
-  RMSE=0.316 but crashed; depth<=6 is still competitive and stable.
+  The codespace has ~8GB RAM. We allow max_depth up to 9 and n_estimators
+  up to 800 -- prior tuning on the 168-IL dataset found depth=9, n_est=783
+  was optimal without OOM. tree_method=hist is used throughout to reduce
+  memory vs the exact method.
+
+KEY REGULARIZATION PARAMS (v2 addition):
+  min_child_weight: minimum sum of instance weight in a leaf. Higher values
+  prevent the tree from learning splits that cover very few ILs -- the most
+  direct way to combat overfitting on our sparse 4114-feature / 211-IL matrix.
+  Searched over 1-20. This is the most likely param to close the CV/test gap.
+
+  reg_alpha (L1) and reg_lambda (L2): penalize large leaf weights. Both
+  searched log-uniformly over [1e-8, 10.0].
+
+STUDY NAMES:
+  v2 = 211-IL expanded dataset (delete logs/optuna.db before running).
+  v1 = old 168-IL dataset (obsolete).
 
 OUTPUTS:
   results/tuning_results_rf.csv    -- all RF trials with their CV RMSE
@@ -39,6 +51,7 @@ INPUT:
   data/processed/train_set.csv  (from build_dataset.py)
 
 Run from project root:
+    rm logs/optuna.db   # required if switching from v1 to v2
     python src/tune_hyperparameters.py
 """
 
@@ -74,15 +87,15 @@ RANDOM_SEED        = 42
 N_TRIALS_RF  = 50
 N_TRIALS_XGB = 50
 
-STUDY_NAME_RF  = "rf_co2_il_v1"
-STUDY_NAME_XGB = "xgb_co2_il_v1"
+# v2 = 211-IL expanded dataset. Bump version when restarting on a new dataset.
+STUDY_NAME_RF  = "rf_co2_il_v2"
+STUDY_NAME_XGB = "xgb_co2_il_v2"
 
-# XGBoost memory-safe search bounds.
-# max_depth capped at 6 (not 10) to prevent OOM on codespace ~8GB RAM.
-# n_estimators capped at 500 (not 800) for same reason.
-# These ranges still cover the scientifically useful hyperparameter space.
-XGB_MAX_DEPTH_MAX   = 6
-XGB_N_EST_MAX       = 500
+# XGB search bounds (v2: raised from depth=6/n_est=500 after confirming
+# depth=9, n_est=783 ran without OOM on 168-IL dataset).
+XGB_MAX_DEPTH_MAX        = 9
+XGB_N_EST_MAX            = 800
+XGB_MIN_CHILD_WEIGHT_MAX = 20   # higher = more regularization against IL-level overfitting
 
 
 def load_train_data() -> tuple:
@@ -153,32 +166,41 @@ def xgb_objective(trial, X: np.ndarray, y: np.ndarray,
     """
     Optuna objective for XGBoost -- returns GroupKFold CV RMSE.
 
-    Search bounds are tightened vs naive defaults to avoid OOM on codespace:
-      max_depth: 3-6 (not 3-10) -- depth 7+ on 4114 features uses >4GB
-      n_estimators: 100-500 (not 100-800) -- large ensembles compound memory use
-    These bounds still cover the optimal hyperparameter region for our dataset.
+    v2 search space additions vs v1:
+      min_child_weight: 1-20 (new) -- key regularizer for IL-level overfitting.
+        Minimum sum of instance weight required to create a new leaf split.
+        Higher values = fewer, more general splits = less memorization of
+        individual IL structure patterns. This directly addresses the 0.25
+        CV/test R2 gap observed after training on the 211-IL dataset.
+
+      max_depth: up to 9 (was 6) -- prior tuning confirmed depth=9 is safe.
+      n_estimators: up to 800 (was 500) -- prior tuning found n_est=783 optimal.
+      reg_alpha, reg_lambda: unchanged (L1/L2 leaf weight penalties).
     """
-    n_estimators  = trial.suggest_int("n_estimators", 100, XGB_N_EST_MAX)
-    learning_rate = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
-    max_depth     = trial.suggest_int("max_depth", 3, XGB_MAX_DEPTH_MAX)
-    subsample     = trial.suggest_float("subsample", 0.5, 1.0)
-    colsample     = trial.suggest_float("colsample_bytree", 0.3, 1.0)
-    reg_alpha     = trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True)
-    reg_lambda    = trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True)
+    n_estimators      = trial.suggest_int("n_estimators", 100, XGB_N_EST_MAX)
+    learning_rate     = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
+    max_depth         = trial.suggest_int("max_depth", 3, XGB_MAX_DEPTH_MAX)
+    subsample         = trial.suggest_float("subsample", 0.5, 1.0)
+    colsample         = trial.suggest_float("colsample_bytree", 0.3, 1.0)
+    reg_alpha         = trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True)
+    reg_lambda        = trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True)
+    min_child_weight  = trial.suggest_int("min_child_weight", 1, XGB_MIN_CHILD_WEIGHT_MAX)
 
     model = XGBRegressor(
         n_estimators=n_estimators, learning_rate=learning_rate,
         max_depth=max_depth, subsample=subsample,
         colsample_bytree=colsample, reg_alpha=reg_alpha, reg_lambda=reg_lambda,
+        min_child_weight=min_child_weight,
         random_state=RANDOM_SEED,
-        n_jobs=2,       # limit to 2 cores (not -1) to cap memory use per trial
+        n_jobs=2,          # limit to 2 cores (not -1) to cap memory use per trial
         verbosity=0,
         tree_method="hist",  # histogram method uses less memory than exact
     )
     rmse = grouped_cv_rmse(model, X, y, il_smiles)
     print(f"  XGB Trial {trial.number:3d}: RMSE={rmse:.4f} | "
           f"n_est={n_estimators}, lr={learning_rate:.4f}, depth={max_depth}, "
-          f"alpha={reg_alpha:.2e}, lambda={reg_lambda:.2e}", flush=True)
+          f"mcw={min_child_weight}, alpha={reg_alpha:.2e}, lambda={reg_lambda:.2e}",
+          flush=True)
     return rmse
 
 
@@ -264,9 +286,12 @@ def main():
     os.makedirs(LOGS_DIR,    exist_ok=True)
 
     print(f"[main] Optuna checkpoint DB: {OPTUNA_DB_PATH}", flush=True)
-    print(f"[main] If interrupted, re-run to resume from checkpoint.", flush=True)
-    print(f"[main] XGB search bounds: max_depth<=6, n_est<=500, tree_method=hist",
+    print(f"[main] Study names: RF={STUDY_NAME_RF}, XGB={STUDY_NAME_XGB} (v2 = 211-IL dataset)",
           flush=True)
+    print(f"[main] XGB search bounds: max_depth<={XGB_MAX_DEPTH_MAX}, "
+          f"n_est<={XGB_N_EST_MAX}, min_child_weight<=20, tree_method=hist",
+          flush=True)
+    print(f"[main] If interrupted, re-run to resume from checkpoint.", flush=True)
 
     X_train, y_train, il_smiles_train, feature_cols = load_train_data()
 
@@ -279,7 +304,7 @@ def main():
     trials_rf.to_csv(os.path.join(RESULTS_DIR, "tuning_results_rf.csv"), index=False)
     print(f"[main] RF results saved -> results/tuning_results_rf.csv", flush=True)
 
-    # XGB tuning (resumes from DB -- currently has 1 completed trial)
+    # XGB tuning
     best_params_xgb, trials_xgb = run_study(
         STUDY_NAME_XGB, "XGBoost", xgb_objective, N_TRIALS_XGB,
         X_train, y_train, il_smiles_train
