@@ -25,6 +25,12 @@ MISSING P_kPa HANDLING:
   (Henry's law: x2 ∝ P) and imputing wrongly biases predictions.
   The affected ILs are reported so they can be manually checked.
 
+FEATURE MATRIX:
+  FEATURES_CSV now points at filtered_il_features.csv (variance-filtered).
+  reduce_features.py removed 3725/4096 near-zero-variance Morgan FP bits,
+  leaving 371 informative bits + 16 RDKit descriptors = 387 features total
+  (was 4112). This reduces noise for the RF and speeds up training.
+
 DATA SOURCE:
   DATAPOINTS_CSV now points at the merged ILThermo + ThermoML dataset
   (211 → 299 unique ILs, 9,168 → 13,767 rows after deduplication).
@@ -32,7 +38,7 @@ DATA SOURCE:
 
 INPUT:
   data/raw/all_co2_datapoints_merged.csv  (ILThermo + ThermoML, from merge script)
-  data/processed/il_features.csv          (from featurize.py)
+  data/processed/filtered_il_features.csv (variance-filtered, from reduce_features.py)
 
 OUTPUT:
   data/processed/ml_dataset.csv          — full merged dataset (NaN-clean)
@@ -52,9 +58,10 @@ import json
 from sklearn.model_selection import GroupShuffleSplit
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-# UPDATED: now uses the merged ILThermo + ThermoML dataset (299 unique ILs)
 DATAPOINTS_CSV  = os.path.join("data", "raw",       "all_co2_datapoints_merged.csv")
-FEATURES_CSV    = os.path.join("data", "processed", "il_features.csv")
+# UPDATED: points at variance-filtered features (371 FP bits, was 4096)
+# Run src/reduce_features.py first if this file doesn't exist.
+FEATURES_CSV    = os.path.join("data", "processed", "filtered_il_features.csv")
 ML_DATASET_CSV  = os.path.join("data", "processed", "ml_dataset.csv")
 TRAIN_CSV       = os.path.join("data", "processed", "train_set.csv")
 TEST_CSV        = os.path.join("data", "processed", "test_set.csv")
@@ -142,11 +149,6 @@ def merge_features(datapoints_df: pd.DataFrame, features_df: pd.DataFrame) -> pd
     """
     Join measurement rows with IL features on il_smiles.
     Uses inner join — rows without a matching featurized IL are dropped and reported.
-
-    NOTE: The merged dataset contains 88 new ThermoML ILs that may not yet
-    have entries in il_features.csv. Those ILs will be dropped here with a warning.
-    Run src/featurize.py first to generate features for all 299 ILs, then
-    re-run this script to capture the full dataset.
     """
     feature_cols = [c for c in features_df.columns
                     if c.startswith("cat_") or c.startswith("an_")]
@@ -158,10 +160,6 @@ def merge_features(datapoints_df: pd.DataFrame, features_df: pd.DataFrame) -> pd
 
     if dropped > 0:
         print(f"[merge_features] WARNING: {dropped} rows dropped during merge")
-        print(f"  ILs in datapoints but not in features (likely new ThermoML ILs).")
-        print(f"  Run src/featurize.py to generate features for all ILs, then re-run.")
-
-        # Show which ILs are missing features
         merged_smiles   = set(merged_df["il_smiles"])
         missing_smiles  = set(datapoints_df["il_smiles"]) - merged_smiles
         name_col = "il_name" if "il_name" in datapoints_df.columns else "il_smiles"
@@ -175,7 +173,7 @@ def merge_features(datapoints_df: pd.DataFrame, features_df: pd.DataFrame) -> pd
     return merged_df
 
 
-def stratified_il_split(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def stratified_il_split(merged_df: pd.DataFrame) -> tuple:
     """
     Split by IL identity so all rows for a given IL stay in the same split.
     Uses sklearn's GroupShuffleSplit with il_smiles as the group key.
@@ -192,7 +190,6 @@ def stratified_il_split(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     train_df = merged_df.iloc[train_idx].reset_index(drop=True)
     test_df  = merged_df.iloc[test_idx].reset_index(drop=True)
 
-    # Verify zero IL overlap
     overlap = set(train_df["il_smiles"]) & set(test_df["il_smiles"])
     if overlap:
         print(f"[ERROR] {len(overlap)} ILs appear in BOTH splits — data leakage!")
