@@ -1,8 +1,19 @@
 """
 train_model.py
 --------------
-PURPOSE: Train a Random Forest and XGBoost regressor to predict log10(CO2 mole
-         fraction solubility) from IL molecular features + temperature + pressure.
+PURPOSE: Train an XGBoost regressor to predict log10(CO2 mole fraction
+         solubility) from IL molecular features + temperature + pressure.
+
+         RF was removed from the training loop. XGBoost consistently
+         outperforms RF (CV R² 0.67 vs 0.41 on 211-IL dataset) and the gap
+         is not closable by tuning. Running RF wastes time and adds no value.
+
+XGB HYPERPARAMETERS:
+  These come directly from src/tune_hyperparameters.py (Optuna Bayesian search,
+  50 trials, GroupKFold CV on 239-IL dataset). Best CV RMSE = 0.3498.
+  Key insight from tuning: min_child_weight=10 (high regularization) and
+  max_depth=5 (shallow trees) were optimal -- confirms the model was overfitting
+  on the sparse 4114-feature / 239-IL matrix with default settings.
 
 WHY T_K AND P_kPa ARE INCLUDED AS FEATURES:
   The first run (structure-only) produced R² ≈ -0.10 (worse than predicting the mean).
@@ -19,7 +30,7 @@ CROSS-VALIDATION STRATEGY — Repeated GroupKFold:
   This averages out the variance from unlucky fold composition.
 
   WHY REPEATED:
-    With only 168 ILs and 5 folds, each fold contains ~34 ILs. One fold might by
+    With only ~239 ILs and 5 folds, each fold contains ~48 ILs. One fold might by
     chance contain a structurally unusual IL family with no training precedent (e.g.
     all phosphonium ILs in one fold), giving a very bad fold score that drags down
     the mean and inflates std. A single GroupKFold run (5 folds) can give std ≈ 0.44
@@ -53,7 +64,6 @@ import os
 import numpy as np
 import pandas as pd
 import joblib
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from sklearn.model_selection import GroupKFold
 from sklearn.utils import shuffle
@@ -73,17 +83,18 @@ CV_REPEATS         = 5    # number of times to repeat with different random shuf
                            # total CV evaluations = CV_FOLDS * CV_REPEATS = 25
 RANDOM_SEED        = 42
 
-# Random Forest hyperparameters
-RF_N_ESTIMATORS     = 300
-RF_MAX_FEATURES     = "sqrt"   # sqrt(n_features) per split -- standard for RF
-RF_MIN_SAMPLES_LEAF = 3        # prevents overfitting on sparse IL clusters
-
-# XGBoost hyperparameters
-XGB_N_ESTIMATORS    = 500
-XGB_LEARNING_RATE   = 0.05
-XGB_MAX_DEPTH       = 6
-XGB_SUBSAMPLE       = 0.8
-XGB_COLSAMPLE       = 0.8
+# XGBoost hyperparameters — from Optuna tuning (tune_hyperparameters.py),
+# 50 trials, GroupKFold CV on 239-IL / 11033-row dataset. Best CV RMSE = 0.3498.
+# min_child_weight=10 and max_depth=5 are the key regularization params that
+# prevent overfitting on the sparse 4114-feature / 239-IL matrix.
+XGB_N_ESTIMATORS    = 200
+XGB_LEARNING_RATE   = 0.08252578137355096
+XGB_MAX_DEPTH       = 5
+XGB_SUBSAMPLE       = 0.7240833769291847
+XGB_COLSAMPLE       = 0.4778802788064814
+XGB_REG_ALPHA       = 0.08067465044762985
+XGB_REG_LAMBDA      = 8.226130315805552e-05
+XGB_MIN_CHILD_WEIGHT = 10
 
 
 def load_split(path: str, label: str) -> tuple:
@@ -274,10 +285,11 @@ def evaluate_on_test(model, X_test: np.ndarray, y_test: np.ndarray,
 def get_feature_importances(model, feature_cols: list, model_name: str,
                             top_n: int = 30) -> pd.DataFrame:
     """
-    Extract and rank feature importances from a fitted tree-based model.
+    Extract and rank feature importances from a fitted XGBoost model (gain metric).
 
-    RF uses mean decrease in impurity; XGBoost uses gain.
     The appearance of T_K / P_kPa near the top is expected and physically meaningful.
+    Morgan fingerprint bits that appear here represent structural motifs that
+    correlate most strongly with CO2 solubility across the training ILs.
     """
     importance_df = pd.DataFrame({
         "feature":    feature_cols,
@@ -292,7 +304,7 @@ def get_feature_importances(model, feature_cols: list, model_name: str,
 
 def main():
     """
-    Main pipeline: load -> repeated GroupKFold CV -> fit -> test evaluation -> save.
+    Main pipeline: load -> repeated GroupKFold CV -> fit on full train -> test evaluation -> save.
     """
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -306,29 +318,26 @@ def main():
           f"{X_train.shape[0]} train rows ({n_unique_train_ils} unique ILs) | "
           f"{X_test.shape[0]} test rows")
 
-    # -- Step 2: Define models -----------------------------------------------
-    random_forest = RandomForestRegressor(
-        n_estimators     = RF_N_ESTIMATORS,
-        max_features     = RF_MAX_FEATURES,
-        min_samples_leaf = RF_MIN_SAMPLES_LEAF,
-        random_state     = RANDOM_SEED,
-        n_jobs           = -1,
-    )
+    # -- Step 2: Define tuned XGBoost model ----------------------------------
+    # Hyperparameters from Optuna tuning (tune_hyperparameters.py, 50 trials).
+    # min_child_weight=10 is the key regularizer: requires at least 10 samples
+    # to justify a new split, preventing memorization of individual ILs.
     xgboost_model = XGBRegressor(
         n_estimators     = XGB_N_ESTIMATORS,
         learning_rate    = XGB_LEARNING_RATE,
         max_depth        = XGB_MAX_DEPTH,
         subsample        = XGB_SUBSAMPLE,
         colsample_bytree = XGB_COLSAMPLE,
+        reg_alpha        = XGB_REG_ALPHA,
+        reg_lambda       = XGB_REG_LAMBDA,
+        min_child_weight = XGB_MIN_CHILD_WEIGHT,
         random_state     = RANDOM_SEED,
         n_jobs           = -1,
         verbosity        = 0,
+        tree_method      = "hist",  # memory-efficient histogram method
     )
 
-    models = {
-        "RandomForest": random_forest,
-        "XGBoost":      xgboost_model,
-    }
+    models = {"XGBoost": xgboost_model}
 
     # -- Step 3: Repeated GroupKFold CV --------------------------------------
     print(f"\n=== CROSS-VALIDATION ({CV_REPEATS}x{CV_FOLDS} Repeated GroupKFold by IL) ===")
@@ -367,14 +376,13 @@ def main():
     print("\n=== FINAL PERFORMANCE COMPARISON ===")
     print(perf_df.to_string(index=False))
 
-    # -- Step 5: Select and save best model ----------------------------------
-    best_idx   = perf_df["test_r2"].idxmax()
-    best_name  = perf_df.loc[best_idx, "model"]
-    best_model = models[best_name]
-    best_r2    = perf_df.loc[best_idx, "test_r2"]
-    best_rmse  = perf_df.loc[best_idx, "test_rmse_log"]
+    # -- Step 5: Save model --------------------------------------------------
+    best_name  = "XGBoost"
+    best_model = xgboost_model
+    best_r2    = perf_df.loc[0, "test_r2"]
+    best_rmse  = perf_df.loc[0, "test_rmse_log"]
 
-    print(f"\n[main] Best model: {best_name}  (R2 = {best_r2:.4f}, RMSE = {best_rmse:.4f})")
+    print(f"\n[main] Model: {best_name}  (R2 = {best_r2:.4f}, RMSE = {best_rmse:.4f})")
 
     model_bundle = {
         "model":        best_model,
@@ -403,18 +411,17 @@ def main():
     print("  models/best_model_name.txt")
 
     # -- Final diagnostic ----------------------------------------------------
-    cv_xgb = next((r for r in cv_results if r["model"] == "XGBoost"), None)
+    cv_xgb = cv_results[0]
     if best_r2 < 0.5:
         print(f"\nWARNING: Best R2 = {best_r2:.4f} -- below 0.5.")
-        print("   Run src/tune_hyperparameters.py or check T/P coverage.")
+        print("   Consider stacking ensemble or PCA on fingerprints.")
     else:
         print(f"\nModel R2 = {best_r2:.4f}. Phase 3 complete.")
-        if cv_xgb:
-            print(f"  Repeated GroupKFold CV R² = {cv_xgb['cv_r2_mean']:.3f} "
-                  f"+/- {cv_xgb['cv_r2_std']:.3f}  "
-                  f"({cv_xgb['n_cv_evaluations']} evaluations)")
-        print("  Next: run src/tune_hyperparameters.py, src/predict_with_uncertainty.py,")
-        print("        src/applicability_domain.py, src/plot_tp_residuals.py")
+        print(f"  Repeated GroupKFold CV R² = {cv_xgb['cv_r2_mean']:.3f} "
+              f"+/- {cv_xgb['cv_r2_std']:.3f}  "
+              f"({cv_xgb['n_cv_evaluations']} evaluations)")
+        print("  Next: src/predict_with_uncertainty.py, src/applicability_domain.py,")
+        print("        src/plot_tp_residuals.py -> Phase 5 DFT inputs")
 
 
 if __name__ == "__main__":
