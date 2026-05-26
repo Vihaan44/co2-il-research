@@ -26,19 +26,22 @@ MISSING P_kPa HANDLING:
   The affected ILs are reported so they can be manually checked.
 
 FEATURE MATRIX:
-  FEATURES_CSV now points at filtered_il_features.csv (variance-filtered).
-  reduce_features.py removed 3725/4096 near-zero-variance Morgan FP bits,
-  leaving 371 informative bits + 16 RDKit descriptors = 387 features total
-  (was 4112). This reduces noise for the RF and speeds up training.
+  FEATURES_CSV points at il_features.csv — the FULL 4096-bit Morgan fingerprint
+  matrix (+ 16 RDKit descriptors = 4112 features total).
+
+  NOTE: variance-threshold filtering (filtered_il_features.csv, 371 bits) was
+  tested and reverted. Filtering removed rare FP bits that were structurally
+  informative despite low variance, dropping test R² from 0.42 → 0.33.
+  The full fingerprint matrix is retained for all downstream modelling.
 
 DATA SOURCE:
-  DATAPOINTS_CSV now points at the merged ILThermo + ThermoML dataset
+  DATAPOINTS_CSV points at the merged ILThermo + ThermoML dataset
   (211 → 299 unique ILs, 9,168 → 13,767 rows after deduplication).
   See src/merge_thermoml_into_pipeline.py for how this was produced.
 
 INPUT:
   data/raw/all_co2_datapoints_merged.csv  (ILThermo + ThermoML, from merge script)
-  data/processed/filtered_il_features.csv (variance-filtered, from reduce_features.py)
+  data/processed/il_features.csv          (full 4096-bit fingerprints, from featurize.py)
 
 OUTPUT:
   data/processed/ml_dataset.csv          — full merged dataset (NaN-clean)
@@ -59,9 +62,9 @@ from sklearn.model_selection import GroupShuffleSplit
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 DATAPOINTS_CSV  = os.path.join("data", "raw",       "all_co2_datapoints_merged.csv")
-# UPDATED: points at variance-filtered features (371 FP bits, was 4096)
-# Run src/reduce_features.py first if this file doesn't exist.
-FEATURES_CSV    = os.path.join("data", "processed", "filtered_il_features.csv")
+# Full 4096-bit Morgan fingerprints + 16 RDKit descriptors.
+# filtered_il_features.csv (371 bits) was tested and reverted — hurt test R².
+FEATURES_CSV    = os.path.join("data", "processed", "il_features.csv")
 ML_DATASET_CSV  = os.path.join("data", "processed", "ml_dataset.csv")
 TRAIN_CSV       = os.path.join("data", "processed", "train_set.csv")
 TEST_CSV        = os.path.join("data", "processed", "test_set.csv")
