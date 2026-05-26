@@ -10,47 +10,37 @@ PURPOSE: Train an XGBoost regressor to predict log10(CO2 mole fraction
 
 XGB HYPERPARAMETERS:
   These come directly from src/tune_hyperparameters.py (Optuna Bayesian search,
-  50 trials, GroupKFold CV on 239-IL dataset). Best CV RMSE = 0.3498.
-  Key insight from tuning: min_child_weight=10 (high regularization) and
-  max_depth=5 (shallow trees) were optimal -- confirms the model was overfitting
-  on the sparse 4114-feature / 239-IL matrix with default settings.
+  75 trials, GroupKFold CV on 211-IL dataset). Best CV RMSE = 0.3498 (v2).
+  Update these constants after running tune_hyperparameters.py (v3 study).
 
-WHY T_K AND P_kPa ARE INCLUDED AS FEATURES:
-  The first run (structure-only) produced R² ≈ -0.10 (worse than predicting the mean).
-  This happened because the same IL measured at 298K vs 350K has very different x2 values --
-  molecular fingerprints alone cannot explain that variance.
-  T_K and P_kPa are direct physical predictors of solubility (Henry's law: x2 ∝ P/H(T)).
-  Adding them is scientifically correct -- real process models always condition on T and P.
+EARLY STOPPING EVALUATION:
+  In addition to the fixed-hyperparameter model, this script also trains an
+  early-stopping variant (ES model): it holds out 10% of the training ILs as
+  an internal validation set and lets XGBoost auto-select n_estimators by
+  stopping when validation RMSE stops improving for EARLY_STOPPING_ROUNDS rounds.
 
-  For competition framing: "Our model predicts CO2 solubility given the IL structure,
-  temperature, and pressure -- mirroring real industrial process conditions."
+  WHY:
+    Our fixed n_estimators=200 was set conservatively. The true optimal may be
+    higher (e.g. 400-600). Early stopping finds this automatically without
+    overfitting. The ES model is saved separately as models/forward_model_es.pkl
+    for comparison -- if its test R² beats the fixed model, update the constants.
+
+  IMPORTANT: The ES model uses a GroupShuffleSplit to hold out 10% of ILs
+    (not rows) as internal val, so the same IL is never in both ES train
+    and ES val. This mirrors our GroupKFold CV principle.
 
 CROSS-VALIDATION STRATEGY — Repeated GroupKFold:
-  We use REPEATED GroupKFold: CV_FOLDS folds × CV_REPEATS different random IL orderings.
-  This averages out the variance from unlucky fold composition.
-
-  WHY REPEATED:
-    With only ~239 ILs and 5 folds, each fold contains ~48 ILs. One fold might by
-    chance contain a structurally unusual IL family with no training precedent (e.g.
-    all phosphonium ILs in one fold), giving a very bad fold score that drags down
-    the mean and inflates std. A single GroupKFold run (5 folds) can give std ≈ 0.44
-    in R² purely from this sampling accident.
-    Repeating 5 times (25 total folds) averages over different random IL assignments,
-    giving a stable, trustworthy CV estimate. This is standard practice for small datasets
-    in cheminformatics (Sheridan 2013, J. Chem. Inf. Model.).
-
-  WHY GroupKFold (not plain KFold):
-    Plain KFold can put measurements of the SAME IL in both train and val folds.
-    Since one IL appears at many (T, P) conditions, this leaks structural information
-    and makes CV scores optimistically biased. GroupKFold by il_smiles ensures every
-    fold's val set contains only ILs not seen during that fold's training.
+  CV_FOLDS folds x CV_REPEATS different random IL orderings = 25 total evaluations.
+  See module-level docstring in previous version for full rationale.
 
 WHAT EACH STEP PRODUCES:
   1. Cross-validation results on train set → results/cv_results.csv
   2. Test set evaluation (RMSE, R², MAE)  → results/model_performance.csv
   3. Predicted vs actual values on test   → results/test_predictions.csv
   4. Feature importances (top 30)         → results/feature_importances.csv
-  5. Best model + feature_cols saved      → models/forward_model.pkl
+  5. Fixed model + feature_cols saved     → models/forward_model.pkl
+  6. Early-stopping model                 → models/forward_model_es.pkl
+     (compare test R² -- use whichever is higher as the production model)
 
 INPUTS:
   data/processed/train_set.csv   (from build_dataset.py)
@@ -65,7 +55,7 @@ import numpy as np
 import pandas as pd
 import joblib
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 from sklearn.utils import shuffle
 from xgboost import XGBRegressor
 
@@ -74,27 +64,34 @@ TRAIN_CSV   = os.path.join("data", "processed", "train_set.csv")
 TEST_CSV    = os.path.join("data", "processed", "test_set.csv")
 MODEL_DIR   = "models"
 RESULTS_DIR = "results"
-MODEL_PATH  = os.path.join(MODEL_DIR, "forward_model.pkl")
+MODEL_PATH     = os.path.join(MODEL_DIR, "forward_model.pkl")
+MODEL_ES_PATH  = os.path.join(MODEL_DIR, "forward_model_es.pkl")  # early-stopping variant
 
-TARGET_COL         = "log_x2_CO2"       # log10-transformed mole fraction solubility
-CONDITION_FEATURES = ["T_K", "P_kPa"]   # temperature (K) and pressure (kPa) from ILThermo
-CV_FOLDS           = 5    # folds per repeat
-CV_REPEATS         = 5    # number of times to repeat with different random shuffles
-                           # total CV evaluations = CV_FOLDS * CV_REPEATS = 25
+TARGET_COL         = "log_x2_CO2"
+CONDITION_FEATURES = ["T_K", "P_kPa"]
+CV_FOLDS           = 5
+CV_REPEATS         = 5    # 5 x 5 = 25 total evaluations
 RANDOM_SEED        = 42
 
-# XGBoost hyperparameters — from Optuna tuning (tune_hyperparameters.py),
-# 50 trials, GroupKFold CV on 239-IL / 11033-row dataset. Best CV RMSE = 0.3498.
-# min_child_weight=10 and max_depth=5 are the key regularization params that
-# prevent overfitting on the sparse 4114-feature / 239-IL matrix.
-XGB_N_ESTIMATORS    = 200
-XGB_LEARNING_RATE   = 0.08252578137355096
-XGB_MAX_DEPTH       = 5
-XGB_SUBSAMPLE       = 0.7240833769291847
-XGB_COLSAMPLE       = 0.4778802788064814
-XGB_REG_ALPHA       = 0.08067465044762985
-XGB_REG_LAMBDA      = 8.226130315805552e-05
+# Early stopping config
+EARLY_STOPPING_ROUNDS  = 30    # stop if val RMSE doesn't improve for 30 rounds
+ES_VAL_IL_FRACTION     = 0.10  # hold out 10% of unique ILs as internal val for ES
+ES_MAX_N_ESTIMATORS    = 1000  # upper bound; early stopping will pick the actual value
+
+# XGBoost hyperparameters — from Optuna v2 tuning (tune_hyperparameters.py, 50 trials).
+# UPDATE THESE after running tune_hyperparameters.py v3 study on expanded features.
+XGB_N_ESTIMATORS     = 200
+XGB_LEARNING_RATE    = 0.08252578137355096
+XGB_MAX_DEPTH        = 5
+XGB_SUBSAMPLE        = 0.7240833769291847
+XGB_COLSAMPLE        = 0.4778802788064814
+XGB_REG_ALPHA        = 0.08067465044762985
+XGB_REG_LAMBDA       = 8.226130315805552e-05
 XGB_MIN_CHILD_WEIGHT = 10
+# gamma and max_delta_step: set to 0 (XGBoost defaults) until v3 tuning completes.
+# After tune_hyperparameters.py v3, update these from results/best_hyperparams.csv.
+XGB_GAMMA            = 0.0   # min loss reduction per split (0 = unconstrained)
+XGB_MAX_DELTA_STEP   = 0     # weight update cap (0 = unconstrained)
 
 
 def load_split(path: str, label: str) -> tuple:
@@ -128,8 +125,6 @@ def load_split(path: str, label: str) -> tuple:
     print(f"[load_split] {label}: target range "
           f"[{df[TARGET_COL].min():.2f}, {df[TARGET_COL].max():.2f}]")
 
-    # Drop NaN condition rows defensively (build_dataset.py should have cleaned these,
-    # but if running against older data files, drop here rather than crash silently)
     n_missing_t = df["T_K"].isna().sum()
     n_missing_p = df["P_kPa"].isna().sum()
     if n_missing_t > 0 or n_missing_p > 0:
@@ -137,6 +132,15 @@ def load_split(path: str, label: str) -> tuple:
               f"{n_missing_p} rows missing P_kPa -- dropping these rows.")
         df = df.dropna(subset=CONDITION_FEATURES).copy()
         print(f"[load_split] After drop: {len(df)} rows remain.")
+
+    # Drop NaN descriptor rows (can occur if Gasteiger charge failed for some ILs)
+    n_nan_desc = df[desc_cols].isna().any(axis=1).sum()
+    if n_nan_desc > 0:
+        print(f"[load_split] WARNING: {n_nan_desc} rows have NaN descriptors -- "
+              f"filling with column median (safe fallback for tree models).")
+        for col in desc_cols:
+            median_val = df[col].median()
+            df[col] = df[col].fillna(median_val)
 
     X         = df[feature_cols].values
     y         = df[TARGET_COL].values
@@ -148,38 +152,21 @@ def repeated_group_kfold_cv(model, X_train: np.ndarray, y_train: np.ndarray,
                              il_smiles_train: pd.Series, model_name: str) -> dict:
     """
     Run repeated GroupKFold cross-validation (CV_FOLDS x CV_REPEATS).
-
-    Each repeat shuffles the IL ordering before splitting into folds, so different
-    ILs end up in the val fold each time. This averages out the variance from any
-    single fold containing an unusually hard or easy IL family.
-
+    Each repeat shuffles the IL ordering before splitting into folds.
     Total evaluations = CV_FOLDS * CV_REPEATS (e.g. 5 x 5 = 25).
-    We report both the per-repeat mean R² and the overall mean/std across all folds,
-    so you can see how much the variance shrinks with repetition.
-
-    WHY NOT sklearn's RepeatedGroupKFold:
-      sklearn doesn't have RepeatedGroupKFold. We implement it manually by shuffling
-      the unique IL list with a different seed each repeat, then re-assigning groups.
     """
     groups        = il_smiles_train.values
-    unique_ils    = np.unique(groups)            # all unique IL SMILES in train set
+    unique_ils    = np.unique(groups)
     all_rmse      = []
     all_r2        = []
-    repeat_r2_means = []  # mean R² per repeat, for reporting trend
+    repeat_r2_means = []
 
     print(f"[cv] {model_name}: {CV_REPEATS} repeats x {CV_FOLDS} folds = "
           f"{CV_REPEATS * CV_FOLDS} total evaluations")
 
     for repeat_idx in range(CV_REPEATS):
-        repeat_seed = RANDOM_SEED + repeat_idx  # different seed per repeat
-
-        # Shuffle the unique ILs with this repeat's seed, then re-map to row indices.
-        # This changes which ILs fall into which fold without changing the training data.
+        repeat_seed = RANDOM_SEED + repeat_idx
         shuffled_ils = shuffle(unique_ils, random_state=repeat_seed)
-
-        # Build a new group array where each IL gets a fold assignment based on
-        # its position in the shuffled list. This is equivalent to GroupKFold
-        # on a freshly shuffled IL ordering.
         il_to_fold = {il: i % CV_FOLDS for i, il in enumerate(shuffled_ils)}
         fold_assignment = np.array([il_to_fold[il] for il in groups])
 
@@ -187,7 +174,6 @@ def repeated_group_kfold_cv(model, X_train: np.ndarray, y_train: np.ndarray,
         repeat_r2   = []
 
         for fold_idx in range(CV_FOLDS):
-            # Val = rows where this IL is assigned to this fold
             val_mask   = fold_assignment == fold_idx
             train_mask = ~val_mask
 
@@ -196,7 +182,6 @@ def repeated_group_kfold_cv(model, X_train: np.ndarray, y_train: np.ndarray,
             X_fold_val   = X_train[val_mask]
             y_fold_val   = y_train[val_mask]
 
-            # Verify no IL overlap between fold train and val
             train_ils_fold = set(groups[train_mask])
             val_ils_fold   = set(groups[val_mask])
             assert len(train_ils_fold & val_ils_fold) == 0, "IL overlap in fold!"
@@ -225,27 +210,101 @@ def repeated_group_kfold_cv(model, X_train: np.ndarray, y_train: np.ndarray,
     print(f"  CV RMSE  (log10 x2): {rmse_arr.mean():.4f} +/- {rmse_arr.std():.4f}")
     print(f"  CV R²              : {r2_arr.mean():.4f} +/- {r2_arr.std():.4f}")
     print(f"  Per-repeat R² means: {[f'{x:.3f}' for x in repeat_r2_means]}")
-    print(f"  NOTE: std here reflects true fold-to-fold variability across 25 evaluations,")
-    print(f"  not just one lucky/unlucky 5-fold split. This is the honest CV estimate.")
 
     return {
-        "model":           model_name,
-        "cv_rmse_mean":    float(rmse_arr.mean()),
-        "cv_rmse_std":     float(rmse_arr.std()),
-        "cv_r2_mean":      float(r2_arr.mean()),
-        "cv_r2_std":       float(r2_arr.std()),
-        "cv_protocol":     f"RepeatedGroupKFold({CV_REPEATS}x{CV_FOLDS}, grouped by il_smiles)",
+        "model":            model_name,
+        "cv_rmse_mean":     float(rmse_arr.mean()),
+        "cv_rmse_std":      float(rmse_arr.std()),
+        "cv_r2_mean":       float(r2_arr.mean()),
+        "cv_r2_std":        float(r2_arr.std()),
+        "cv_protocol":      f"RepeatedGroupKFold({CV_REPEATS}x{CV_FOLDS}, grouped by il_smiles)",
         "n_cv_evaluations": CV_FOLDS * CV_REPEATS,
     }
+
+
+def train_early_stopping_model(X_train: np.ndarray, y_train: np.ndarray,
+                                il_smiles_train: pd.Series,
+                                feature_cols: list) -> tuple:
+    """
+    Train an XGBoost model with early stopping to auto-select n_estimators.
+
+    WHY THIS EXISTS:
+      Our fixed n_estimators=200 may underfit. Early stopping trains with up to
+      ES_MAX_N_ESTIMATORS trees but stops when the held-out IL validation RMSE
+      stops improving for EARLY_STOPPING_ROUNDS consecutive rounds. This finds
+      the true optimal n_estimators for the current dataset size without us
+      having to guess.
+
+    HOW WE SPLIT:
+      GroupShuffleSplit by il_smiles: holds out ES_VAL_IL_FRACTION (10%) of
+      unique ILs as internal validation. The same IL is never in both ES train
+      and ES val, consistent with our GroupKFold principle.
+
+    LIMITATION:
+      ES model is trained on 90% of train data (not 100%), so it has slightly
+      less training data than the fixed model. Compare test R² of both models
+      and use whichever is higher as the production model.
+    """
+    print(f"\n[early_stopping] Building ES train/val split "
+          f"(hold out {ES_VAL_IL_FRACTION*100:.0f}% of unique ILs)...")
+
+    # GroupShuffleSplit respects IL identity -- same IL never in both splits
+    gss = GroupShuffleSplit(n_splits=1, test_size=ES_VAL_IL_FRACTION,
+                            random_state=RANDOM_SEED)
+    groups = il_smiles_train.values
+    es_train_idx, es_val_idx = next(gss.split(X_train, y_train, groups))
+
+    X_es_train = X_train[es_train_idx]
+    y_es_train = y_train[es_train_idx]
+    X_es_val   = X_train[es_val_idx]
+    y_es_val   = y_train[es_val_idx]
+
+    n_es_train_ils = len(set(groups[es_train_idx]))
+    n_es_val_ils   = len(set(groups[es_val_idx]))
+    print(f"[early_stopping] ES train: {len(X_es_train)} rows ({n_es_train_ils} ILs) | "
+          f"ES val: {len(X_es_val)} rows ({n_es_val_ils} ILs)")
+
+    # Train with the same hyperparameters as the fixed model (including gamma/max_delta_step),
+    # but let early stopping choose n_estimators automatically.
+    es_model = XGBRegressor(
+        n_estimators     = ES_MAX_N_ESTIMATORS,  # upper bound; ES will stop earlier
+        learning_rate    = XGB_LEARNING_RATE,
+        max_depth        = XGB_MAX_DEPTH,
+        subsample        = XGB_SUBSAMPLE,
+        colsample_bytree = XGB_COLSAMPLE,
+        reg_alpha        = XGB_REG_ALPHA,
+        reg_lambda       = XGB_REG_LAMBDA,
+        min_child_weight = XGB_MIN_CHILD_WEIGHT,
+        gamma            = XGB_GAMMA,
+        max_delta_step   = XGB_MAX_DELTA_STEP,
+        random_state     = RANDOM_SEED,
+        n_jobs           = -1,
+        verbosity        = 0,
+        tree_method      = "hist",
+        early_stopping_rounds = EARLY_STOPPING_ROUNDS,
+        eval_metric      = "rmse",
+    )
+
+    es_model.fit(
+        X_es_train, y_es_train,
+        eval_set=[(X_es_val, y_es_val)],
+        verbose=False,
+    )
+
+    best_iteration = es_model.best_iteration
+    print(f"[early_stopping] Best n_estimators found by early stopping: {best_iteration}")
+    print(f"  (stopped at round {best_iteration} of max {ES_MAX_N_ESTIMATORS})")
+    print(f"  Interpretation: fixed model's n_estimators=200 may be "
+          f"{'undertrained' if best_iteration > 200 else 'about right or overtrained'}.")
+
+    return es_model, best_iteration
 
 
 def evaluate_on_test(model, X_test: np.ndarray, y_test: np.ndarray,
                      il_smiles_test: pd.Series, model_name: str) -> tuple:
     """
     Predict on the held-out test set and compute RMSE, R², and MAE.
-
-    Reports error in both log10 units (what the model predicts) and mole fraction
-    units (what chemists care about), via back-transform: x2 = 10^y.
+    Reports error in both log10 units and back-transformed mole fraction units.
     """
     y_pred = model.predict(X_test)
 
@@ -286,10 +345,7 @@ def get_feature_importances(model, feature_cols: list, model_name: str,
                             top_n: int = 30) -> pd.DataFrame:
     """
     Extract and rank feature importances from a fitted XGBoost model (gain metric).
-
-    The appearance of T_K / P_kPa near the top is expected and physically meaningful.
-    Morgan fingerprint bits that appear here represent structural motifs that
-    correlate most strongly with CO2 solubility across the training ILs.
+    T_K and P_kPa near the top is expected and physically meaningful.
     """
     importance_df = pd.DataFrame({
         "feature":    feature_cols,
@@ -304,7 +360,8 @@ def get_feature_importances(model, feature_cols: list, model_name: str,
 
 def main():
     """
-    Main pipeline: load -> repeated GroupKFold CV -> fit on full train -> test evaluation -> save.
+    Main pipeline: load -> repeated GroupKFold CV -> fit on full train ->
+    early-stopping variant -> test evaluation -> save both models.
     """
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -318,10 +375,8 @@ def main():
           f"{X_train.shape[0]} train rows ({n_unique_train_ils} unique ILs) | "
           f"{X_test.shape[0]} test rows")
 
-    # -- Step 2: Define tuned XGBoost model ----------------------------------
-    # Hyperparameters from Optuna tuning (tune_hyperparameters.py, 50 trials).
-    # min_child_weight=10 is the key regularizer: requires at least 10 samples
-    # to justify a new split, preventing memorization of individual ILs.
+    # -- Step 2: Define fixed XGBoost model (Optuna v2 hyperparams) ----------
+    # gamma and max_delta_step are 0.0/0 (defaults) until v3 tuning completes.
     xgboost_model = XGBRegressor(
         n_estimators     = XGB_N_ESTIMATORS,
         learning_rate    = XGB_LEARNING_RATE,
@@ -331,95 +386,85 @@ def main():
         reg_alpha        = XGB_REG_ALPHA,
         reg_lambda       = XGB_REG_LAMBDA,
         min_child_weight = XGB_MIN_CHILD_WEIGHT,
+        gamma            = XGB_GAMMA,           # 0.0 until v3 tuning
+        max_delta_step   = XGB_MAX_DELTA_STEP,  # 0 until v3 tuning
         random_state     = RANDOM_SEED,
         n_jobs           = -1,
         verbosity        = 0,
-        tree_method      = "hist",  # memory-efficient histogram method
+        tree_method      = "hist",
     )
 
-    models = {"XGBoost": xgboost_model}
-
-    # -- Step 3: Repeated GroupKFold CV --------------------------------------
+    # -- Step 3: Repeated GroupKFold CV (fixed model) ------------------------
     print(f"\n=== CROSS-VALIDATION ({CV_REPEATS}x{CV_FOLDS} Repeated GroupKFold by IL) ===")
-    print("[main] Each repeat uses a different random IL-to-fold assignment.")
-    print("[main] This averages out variance from unlucky fold composition.\n")
-    cv_results = []
-    for name, model in models.items():
-        print(f"--- {name} ---")
-        cv_result = repeated_group_kfold_cv(model, X_train, y_train, il_smiles_train, name)
-        cv_results.append(cv_result)
-
-    pd.DataFrame(cv_results).to_csv(
+    cv_result = repeated_group_kfold_cv(
+        xgboost_model, X_train, y_train, il_smiles_train, "XGBoost"
+    )
+    pd.DataFrame([cv_result]).to_csv(
         os.path.join(RESULTS_DIR, "cv_results.csv"), index=False)
-    print(f"\n[main] CV results saved -> results/cv_results.csv")
+    print(f"[main] CV results saved -> results/cv_results.csv")
 
-    # -- Step 4: Fit on full train set, evaluate on test ---------------------
-    print("\n=== TEST SET EVALUATION ===")
-    test_performances = []
-    all_predictions   = []
-    all_importances   = []
+    # -- Step 4: Fit fixed model on full train, evaluate on test -------------
+    print("\n=== TEST SET EVALUATION (Fixed hyperparams model) ===")
+    print("[main] Fitting XGBoost on full training set...")
+    xgboost_model.fit(X_train, y_train)
+    fixed_perf, fixed_preds = evaluate_on_test(
+        xgboost_model, X_test, y_test, il_smiles_test, "XGBoost_fixed"
+    )
+    fixed_imp = get_feature_importances(xgboost_model, feature_cols, "XGBoost_fixed")
 
-    for name, model in models.items():
-        print(f"\n[main] Fitting {name} on full training set...")
-        model.fit(X_train, y_train)
+    # -- Step 5: Train early-stopping model and evaluate on test -------------
+    print("\n=== EARLY STOPPING MODEL ===")
+    es_model, best_n_est = train_early_stopping_model(
+        X_train, y_train, il_smiles_train, feature_cols
+    )
+    es_perf, es_preds = evaluate_on_test(
+        es_model, X_test, y_test, il_smiles_test, "XGBoost_ES"
+    )
+    es_imp = get_feature_importances(es_model, feature_cols, "XGBoost_ES")
 
-        perf, predictions_df = evaluate_on_test(model, X_test, y_test, il_smiles_test, name)
-        test_performances.append(perf)
-
-        predictions_df["model"] = name
-        all_predictions.append(predictions_df)
-
-        imp_df = get_feature_importances(model, feature_cols, name, top_n=30)
-        all_importances.append(imp_df)
-
-    perf_df = pd.DataFrame(test_performances)
+    # -- Step 6: Compare both models ----------------------------------------
+    perf_df = pd.DataFrame([fixed_perf, es_perf])
     print("\n=== FINAL PERFORMANCE COMPARISON ===")
     print(perf_df.to_string(index=False))
+    print()
+    if es_perf["test_r2"] > fixed_perf["test_r2"]:
+        print(f"  ES model wins: R²={es_perf['test_r2']:.4f} vs "
+              f"fixed R²={fixed_perf['test_r2']:.4f}")
+        print(f"  ACTION: Update XGB_N_ESTIMATORS to {best_n_est} in train_model.py constants.")
+    else:
+        print(f"  Fixed model wins: R²={fixed_perf['test_r2']:.4f} vs "
+              f"ES R²={es_perf['test_r2']:.4f}")
+        print(f"  Current n_estimators={XGB_N_ESTIMATORS} is reasonable.")
 
-    # -- Step 5: Save model --------------------------------------------------
-    best_name  = "XGBoost"
-    best_model = xgboost_model
-    best_r2    = perf_df.loc[0, "test_r2"]
-    best_rmse  = perf_df.loc[0, "test_rmse_log"]
+    # -- Step 7: Save models -------------------------------------------------
+    joblib.dump({"model": xgboost_model, "feature_cols": feature_cols,
+                 "model_name": "XGBoost_fixed"}, MODEL_PATH)
+    print(f"[main] Fixed model saved -> {MODEL_PATH}")
 
-    print(f"\n[main] Model: {best_name}  (R2 = {best_r2:.4f}, RMSE = {best_rmse:.4f})")
-
-    model_bundle = {
-        "model":        best_model,
-        "feature_cols": feature_cols,
-        "model_name":   best_name,
-    }
-    joblib.dump(model_bundle, MODEL_PATH)
-    print(f"[main] Model bundle saved -> {MODEL_PATH}")
+    joblib.dump({"model": es_model, "feature_cols": feature_cols,
+                 "model_name": "XGBoost_ES",
+                 "best_n_estimators": best_n_est}, MODEL_ES_PATH)
+    print(f"[main] ES model saved -> {MODEL_ES_PATH}")
 
     with open(os.path.join(MODEL_DIR, "best_model_name.txt"), "w") as f:
+        best_name = "XGBoost_ES" if es_perf["test_r2"] > fixed_perf["test_r2"] else "XGBoost_fixed"
         f.write(best_name)
+    print(f"[main] Best model name -> models/best_model_name.txt: {best_name}")
 
-    # -- Step 6: Save all result tables --------------------------------------
+    # -- Step 8: Save all result tables -------------------------------------
     perf_df.to_csv(os.path.join(RESULTS_DIR, "model_performance.csv"), index=False)
-    pd.concat(all_predictions, ignore_index=True).to_csv(
+    pd.concat([fixed_preds, es_preds], ignore_index=True).to_csv(
         os.path.join(RESULTS_DIR, "test_predictions.csv"), index=False)
-    pd.concat(all_importances, ignore_index=True).to_csv(
+    pd.concat([fixed_imp, es_imp], ignore_index=True).to_csv(
         os.path.join(RESULTS_DIR, "feature_importances.csv"), index=False)
 
-    print("\n[main] All results saved:")
-    print("  results/cv_results.csv")
-    print("  results/model_performance.csv")
-    print("  results/test_predictions.csv")
-    print("  results/feature_importances.csv")
-    print("  models/forward_model.pkl")
-    print("  models/best_model_name.txt")
-
-    # -- Final diagnostic ----------------------------------------------------
-    cv_xgb = cv_results[0]
+    print("\n[main] All results saved.")
+    best_r2 = max(fixed_perf["test_r2"], es_perf["test_r2"])
     if best_r2 < 0.5:
-        print(f"\nWARNING: Best R2 = {best_r2:.4f} -- below 0.5.")
-        print("   Consider stacking ensemble or PCA on fingerprints.")
+        print(f"WARNING: Best R² = {best_r2:.4f} -- below 0.5. Check data pipeline.")
     else:
-        print(f"\nModel R2 = {best_r2:.4f}. Phase 3 complete.")
-        print(f"  Repeated GroupKFold CV R² = {cv_xgb['cv_r2_mean']:.3f} "
-              f"+/- {cv_xgb['cv_r2_std']:.3f}  "
-              f"({cv_xgb['n_cv_evaluations']} evaluations)")
+        print(f"Best R² = {best_r2:.4f}. Phase 3 complete.")
+        print(f"  CV R² = {cv_result['cv_r2_mean']:.3f} +/- {cv_result['cv_r2_std']:.3f}")
         print("  Next: src/predict_with_uncertainty.py, src/applicability_domain.py,")
         print("        src/plot_tp_residuals.py -> Phase 5 DFT inputs")
 

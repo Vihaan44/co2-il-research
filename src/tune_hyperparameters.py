@@ -10,11 +10,9 @@ PURPOSE: Find better hyperparameters for XGBoost using Optuna (Bayesian
 
 CRASH RECOVERY:
   Optuna saves every completed trial to a SQLite database (logs/optuna.db).
-  If the process is interrupted (laptop sleep, codespace timeout), simply
-  re-run this script -- it will load completed trials from the database and
-  continue from where it left off. No trials are re-run.
+  If the process is interrupted, simply re-run -- it will resume from the DB.
 
-  To start completely fresh (discard all prior trials):
+  To start completely fresh (new dataset or new feature set):
     rm logs/optuna.db
     python src/tune_hyperparameters.py
 
@@ -22,27 +20,26 @@ WHY GroupKFold INSIDE TUNING:
   Every candidate hyperparameter set is evaluated by GroupKFold (grouped by
   il_smiles). This prevents the tuner from overfitting to measurement repeats
   of the same IL -- without this, the "best" parameters would be those that
-  best memorize repeated T/P conditions, not those that best generalize to
-  new ILs.
+  best memorize repeated T/P conditions, not those that generalize to new ILs.
 
-XGB MEMORY CONSTRAINTS:
-  The codespace has ~8GB RAM. We allow max_depth up to 9 and n_estimators
-  up to 800 -- prior tuning on the 168-IL dataset found depth=9, n_est=783
-  was optimal without OOM. tree_method=hist is used throughout to reduce
-  memory vs the exact method.
+NEW IN v3 SEARCH SPACE:
+  gamma (min_split_loss): minimum loss reduction required to make a split.
+    Values > 0 force XGBoost to only split when it meaningfully reduces error.
+    This is a powerful regularizer on sparse fingerprint matrices -- many
+    fingerprint bits will fire on only 1-2 ILs, and gamma prevents the model
+    from making splits purely on those rare bits.
+    Search range: 0.0 to 5.0.
 
-KEY REGULARIZATION PARAMS:
-  min_child_weight: minimum sum of instance weight in a leaf. Higher values
-  prevent the tree from learning splits that cover very few ILs -- the most
-  direct way to combat overfitting on our sparse 4114-feature / 211-IL matrix.
-  Searched over 1-20.
+  max_delta_step: maximum allowed weight update per step (0 = unconstrained).
+    Non-zero values (1-10) can help with imbalanced data and prevent a single
+    IL cluster from dominating the gradient update. Useful insurance given our
+    dataset has uneven IL family coverage.
+    Search range: 0 to 10.
 
-  reg_alpha (L1) and reg_lambda (L2): penalize large leaf weights. Both
-  searched log-uniformly over [1e-8, 10.0].
+  N_TRIALS_XGB bumped from 50 to 75 to allow Optuna to explore the larger
+  search space introduced by gamma and max_delta_step.
 
-STUDY NAME:
-  v2 = 211-IL expanded dataset (delete logs/optuna.db before running).
-  v1 = old 168-IL dataset (obsolete).
+  STUDY_NAME bumped to v3 -- delete logs/optuna.db before running.
 
 OUTPUTS:
   results/tuning_results_xgb.csv   -- all XGBoost trials with their CV RMSE
@@ -51,10 +48,10 @@ OUTPUTS:
   logs/optuna.db                   -- SQLite checkpoint (auto-resume on crash)
 
 INPUT:
-  data/processed/train_set.csv  (from build_dataset.py)
+  data/processed/train_set.csv  (from build_dataset.py, must use v2 features)
 
 Run from project root:
-    rm logs/optuna.db   # required if switching from v1 to v2
+    rm logs/optuna.db          # required: discard v2 study before v3
     python src/tune_hyperparameters.py
 """
 
@@ -86,16 +83,27 @@ CONDITION_FEATURES = ["T_K", "P_kPa"]
 CV_FOLDS           = 5
 RANDOM_SEED        = 42
 
-N_TRIALS_XGB = 50
+N_TRIALS_XGB = 75   # bumped from 50 to cover expanded search space (added gamma, max_delta_step)
 
-# v2 = 211-IL expanded dataset. Bump version when restarting on a new dataset.
-STUDY_NAME_XGB = "xgb_co2_il_v2"
+# v3 = 211-IL dataset + expanded 18-descriptor feature set + gamma/max_delta_step search.
+# Bump version when restarting on a new dataset or feature set.
+# IMPORTANT: delete logs/optuna.db before running to start a fresh v3 study.
+STUDY_NAME_XGB = "xgb_co2_il_v3"
 
-# XGB search bounds (v2: raised from depth=6/n_est=500 after confirming
-# depth=9, n_est=783 ran without OOM on 168-IL dataset).
+# XGB search bounds
 XGB_MAX_DEPTH_MAX        = 9
 XGB_N_EST_MAX            = 800
-XGB_MIN_CHILD_WEIGHT_MAX = 20   # higher = more regularization against IL-level overfitting
+XGB_MIN_CHILD_WEIGHT_MAX = 20
+
+# gamma: minimum loss reduction to make a split.
+# 0 = no constraint (XGBoost default). Range [0, 5] covers common use cases.
+# High gamma (>1) aggressively prunes splits on rare fingerprint bits.
+XGB_GAMMA_MAX = 5.0
+
+# max_delta_step: caps each tree's weight update.
+# 0 = unconstrained. Range [0, 10].
+# Helps when certain IL families dominate the gradient (unbalanced coverage).
+XGB_MAX_DELTA_STEP_MAX = 10
 
 
 def load_train_data() -> tuple:
@@ -116,6 +124,8 @@ def load_train_data() -> tuple:
     print(f"[load_train_data] {df.shape[0]} rows, {df['il_smiles'].nunique()} unique ILs",
           flush=True)
     print(f"[load_train_data] {len(feature_cols)} features", flush=True)
+    print(f"[load_train_data] Study: {STUDY_NAME_XGB} | Trials: {N_TRIALS_XGB}",
+          flush=True)
 
     X         = df[feature_cols].values
     y         = df[TARGET_COL].values
@@ -146,16 +156,21 @@ def xgb_objective(trial, X: np.ndarray, y: np.ndarray,
     """
     Optuna objective for XGBoost -- returns GroupKFold CV RMSE.
 
-    v2 search space additions vs v1:
-      min_child_weight: 1-20 (new) -- key regularizer for IL-level overfitting.
-        Minimum sum of instance weight required to create a new leaf split.
-        Higher values = fewer, more general splits = less memorization of
-        individual IL structure patterns. This directly addresses the 0.25
-        CV/test R2 gap observed after training on the 211-IL dataset.
+    v3 search space additions:
+      gamma: minimum loss reduction to make a split. Directly prevents the model
+        from learning splits on fingerprint bits that occur in only 1-2 ILs.
+        This is the most impactful regularizer we were previously not tuning.
 
-      max_depth: up to 9 (was 6) -- prior tuning confirmed depth=9 is safe.
-      n_estimators: up to 800 (was 500) -- prior tuning found n_est=783 optimal.
-      reg_alpha, reg_lambda: unchanged (L1/L2 leaf weight penalties).
+      max_delta_step: caps per-step weight updates. Useful insurance against
+        IL family imbalance (e.g. if imidazolium ILs dominate gradients).
+
+    v2 params retained:
+      min_child_weight: 1-20 -- minimum samples per leaf.
+      reg_alpha, reg_lambda: L1/L2 leaf weight penalties.
+      subsample, colsample_bytree: row/column subsampling.
+      n_estimators: 100-800.
+      learning_rate: 0.01-0.3 log-uniform.
+      max_depth: 3-9.
     """
     n_estimators      = trial.suggest_int("n_estimators", 100, XGB_N_EST_MAX)
     learning_rate     = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
@@ -165,21 +180,26 @@ def xgb_objective(trial, X: np.ndarray, y: np.ndarray,
     reg_alpha         = trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True)
     reg_lambda        = trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True)
     min_child_weight  = trial.suggest_int("min_child_weight", 1, XGB_MIN_CHILD_WEIGHT_MAX)
+    # New in v3:
+    gamma             = trial.suggest_float("gamma", 0.0, XGB_GAMMA_MAX)  # min loss reduction per split
+    max_delta_step    = trial.suggest_int("max_delta_step", 0, XGB_MAX_DELTA_STEP_MAX)  # weight update cap
 
     model = XGBRegressor(
         n_estimators=n_estimators, learning_rate=learning_rate,
         max_depth=max_depth, subsample=subsample,
         colsample_bytree=colsample, reg_alpha=reg_alpha, reg_lambda=reg_lambda,
         min_child_weight=min_child_weight,
+        gamma=gamma,                     # new v3
+        max_delta_step=max_delta_step,   # new v3
         random_state=RANDOM_SEED,
-        n_jobs=2,          # limit to 2 cores (not -1) to cap memory use per trial
+        n_jobs=2,          # limit to 2 cores to cap memory use per trial
         verbosity=0,
-        tree_method="hist",  # histogram method uses less memory than exact
+        tree_method="hist",
     )
     rmse = grouped_cv_rmse(model, X, y, il_smiles)
     print(f"  XGB Trial {trial.number:3d}: RMSE={rmse:.4f} | "
           f"n_est={n_estimators}, lr={learning_rate:.4f}, depth={max_depth}, "
-          f"mcw={min_child_weight}, alpha={reg_alpha:.2e}, lambda={reg_lambda:.2e}",
+          f"mcw={min_child_weight}, gamma={gamma:.2f}, mds={max_delta_step}",
           flush=True)
     return rmse
 
@@ -209,8 +229,7 @@ def run_study(study_name: str, objective_fn,
           f"{n_remaining} remaining (target={n_trials})", flush=True)
 
     if n_remaining == 0:
-        print(f"[run_study] XGBoost: already complete -- loading from DB.",
-              flush=True)
+        print(f"[run_study] XGBoost: already complete -- loading from DB.", flush=True)
     else:
         study.optimize(
             lambda trial: objective_fn(trial, X, y, il_smiles),
@@ -236,7 +255,7 @@ def retrain_best_model(best_params_xgb: dict,
                        X_train: np.ndarray, y_train: np.ndarray,
                        feature_cols: list) -> tuple:
     """Retrain XGBoost with best tuned params on the full training set."""
-    model_name = "XGBoost_tuned"
+    model_name = "XGBoost_tuned_v3"
     print(f"\n[retrain] Fitting {model_name} on full train set ...", flush=True)
     best_model = XGBRegressor(
         **best_params_xgb, random_state=RANDOM_SEED,
@@ -253,17 +272,18 @@ def main():
     os.makedirs(LOGS_DIR,    exist_ok=True)
 
     print(f"[main] Optuna checkpoint DB: {OPTUNA_DB_PATH}", flush=True)
-    print(f"[main] Study: {STUDY_NAME_XGB} (v2 = 211-IL dataset)", flush=True)
+    print(f"[main] Study: {STUDY_NAME_XGB} (v3 = 211-IL dataset + 18-descriptor features)",
+          flush=True)
+    print(f"[main] New in v3: gamma [0,5] and max_delta_step [0,10] added to search space",
+          flush=True)
     print(f"[main] XGB search bounds: max_depth<={XGB_MAX_DEPTH_MAX}, "
-          f"n_est<={XGB_N_EST_MAX}, min_child_weight<=20, tree_method=hist",
+          f"n_est<={XGB_N_EST_MAX}, min_child_weight<={XGB_MIN_CHILD_WEIGHT_MAX}, "
+          f"gamma<={XGB_GAMMA_MAX}, tree_method=hist", flush=True)
+    print(f"[main] REMINDER: delete logs/optuna.db before running if switching from v2 study.",
           flush=True)
-    print(f"[main] RF tuning removed -- XGB CV R2 0.67 vs RF 0.41; gap is not closable by tuning.",
-          flush=True)
-    print(f"[main] If interrupted, re-run to resume from checkpoint.", flush=True)
 
     X_train, y_train, il_smiles_train, feature_cols = load_train_data()
 
-    # XGB tuning (resumes from DB if partially done)
     best_params_xgb, trials_xgb = run_study(
         STUDY_NAME_XGB, xgb_objective, N_TRIALS_XGB,
         X_train, y_train, il_smiles_train
@@ -275,7 +295,7 @@ def main():
     best_cv_xgb = trials_xgb.iloc[0]["cv_rmse"]
 
     best_hyperparams = pd.DataFrame([
-        {"model": "XGBoost", "best_cv_rmse": best_cv_xgb, **best_params_xgb},
+        {"model": "XGBoost_v3", "best_cv_rmse": best_cv_xgb, **best_params_xgb},
     ])
     best_hyperparams.to_csv(os.path.join(RESULTS_DIR, "best_hyperparams.csv"), index=False)
     print("\n=== BEST HYPERPARAMETERS ===", flush=True)
@@ -288,6 +308,11 @@ def main():
                  "model_name": model_name}, TUNED_MODEL_PATH)
     print(f"[main] Tuned model saved -> {TUNED_MODEL_PATH}", flush=True)
     print("[main] DONE.", flush=True)
+    print()
+    print("NEXT STEPS:")
+    print("  1. python src/eval_tuned_model.py   # evaluate tuned model on test set")
+    print("  2. Update XGB_* constants in train_model.py with best params from")
+    print("     results/best_hyperparams.csv, then re-run train_model.py")
 
 
 if __name__ == "__main__":
