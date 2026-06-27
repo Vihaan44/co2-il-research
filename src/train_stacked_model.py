@@ -38,11 +38,22 @@ GROUP-AWARE CV:
 BASE MODEL HYPERPARAMETERS:
   RF:       Optuna v2 best params
   XGB:      Optuna v3 best params (min_child_weight=1 corrects v2's T_K suppression)
-  CatBoost: >>> UPDATE FROM tune_catboost.py OUTPUT <<<
-            Defaults below. Run tune_catboost.py, then replace the CATBOOST_* constants.
+  CatBoost: Optuna v1 best params (75 trials, CV RMSE 0.3641 -> 0.3448)
   LightGBM: Optional 4th model. Set INCLUDE_LGB = True after checking
             residual correlation vs XGB via measure_residual_correlations.py.
-            Only include if r_vs_xgb < 0.85.
+            Only include if r_vs_xgb < 0.85. NOT YET MEASURED for LGB --
+            keep INCLUDE_LGB = False until that check is run.
+
+ABLATION NOTE (logs/ablation_mlp_ridge.log):
+  MLP (full features) and Ridge (descriptors only) were both tested as candidate
+  4th/5th ensemble members and EXCLUDED:
+    - MLP:   OOF R²=0.2047, r_vs_xgb=0.593
+    - Ridge: OOF R²=0.0514, r_vs_xgb=0.529
+  Both have low correlation with XGB (which would normally suggest diversity
+  value), but their solo skill is far below the other base models. A weak
+  learner with low correlation still adds little: the Ridge meta-learner either
+  assigns it near-zero weight (no harm, no benefit) or non-trivial weight
+  (overfitting OOF noise from a low-skill model). Excluded from the ensemble.
 
 INPUTS:
   data/processed/train_set.csv   (from build_dataset.py)
@@ -67,7 +78,7 @@ import joblib
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.metrics import mean_squared_error, r2_score as sk_r2_score, mean_absolute_error
 from sklearn.model_selection import GroupKFold
 from xgboost import XGBRegressor
 
@@ -106,17 +117,16 @@ XGB_COLSAMPLE        = 0.460
 XGB_REG_ALPHA        = 1.2
 XGB_REG_LAMBDA       = 0.8
 
-# ---- CatBoost: UPDATE THESE after running tune_catboost.py ----
-# Run:  nohup python src/tune_catboost.py > logs/tune_catboost.log 2>&1 &
-# Then paste the printed BEST PARAMS block here:
-# -----------------------------------------------------------------------
-CATBOOST_ITERATIONS      = 500    # <-- replace with tuned value
-CATBOOST_LEARNING_RATE   = 0.05   # <-- replace with tuned value
-CATBOOST_DEPTH           = 6      # <-- replace with tuned value
-CATBOOST_L2_LEAF_REG     = 3.0    # <-- replace with tuned value (default=3)
-CATBOOST_BORDER_COUNT    = 254    # <-- replace with tuned value
-CATBOOST_BAGGING_TEMP    = 1.0    # <-- replace with tuned value (default=1.0)
-# -----------------------------------------------------------------------
+# ---- CatBoost: Optuna v1 best params ----
+# tune_catboost.py, 75 trials, GroupKFold 5-fold CV.
+# Best CV RMSE: 0.3448 (vs 0.3641 for an early default-ish trial) -- modest gain,
+# consistent with CatBoost's defaults already being strong out of the box.
+CATBOOST_ITERATIONS      = 432
+CATBOOST_LEARNING_RATE   = 0.13184562661431584
+CATBOOST_DEPTH           = 7
+CATBOOST_L2_LEAF_REG     = 10.894623708254054
+CATBOOST_BORDER_COUNT    = 121
+CATBOOST_BAGGING_TEMP    = 0.9280224125290069
 
 # ---- LGB best params ----
 # Update from results/tuning_results_lgb.csv after tune_hyperparameters.py finishes.
@@ -198,8 +208,9 @@ def make_xgb() -> XGBRegressor:
 
 def make_catboost():
     """
-    Instantiate CatBoost with Optuna-tuned hyperparameters.
-    CatBoost's symmetric trees gave R²≈0.726 (best solo model in ablation).
+    Instantiate CatBoost with Optuna-tuned hyperparameters (tune_catboost.py, v1).
+    CatBoost's symmetric trees gave R²≈0.726 (best solo model in ablation) even
+    before tuning; tuning improved CV RMSE from 0.3641 to 0.3448.
     Returns None if catboost is not installed -- ensemble degrades gracefully.
     """
     try:
@@ -317,22 +328,22 @@ def generate_oof_predictions(X_train: np.ndarray, y_train: np.ndarray,
         # Per-fold diagnostic
         n_val_ils = len(set(groups[val_idx]))
         line = (f"  Fold {fold_idx+1}/{CV_FOLDS}: {n_val_ils} val ILs | "
-                f"RF={r2_score(y_train[val_idx], oof_rf[val_idx]):.3f}, "
-                f"XGB={r2_score(y_train[val_idx], oof_xgb[val_idx]):.3f}")
+                f"RF={sk_r2_score(y_train[val_idx], oof_rf[val_idx]):.3f}, "
+                f"XGB={sk_r2_score(y_train[val_idx], oof_xgb[val_idx]):.3f}")
         if catboost_template is not None:
-            line += f", CB={r2_score(y_train[val_idx], oof_cat[val_idx]):.3f}"
+            line += f", CB={sk_r2_score(y_train[val_idx], oof_cat[val_idx]):.3f}"
         if lgb_template is not None:
-            line += f", LGB={r2_score(y_train[val_idx], oof_lgb[val_idx]):.3f}"
+            line += f", LGB={sk_r2_score(y_train[val_idx], oof_lgb[val_idx]):.3f}"
         print(line, flush=True)
 
     # Summarise combined OOF R²
     print(f"\n[oof] Combined OOF R²: "
-          f"RF={r2_score(y_train, oof_rf):.4f}, "
-          f"XGB={r2_score(y_train, oof_xgb):.4f}", flush=True)
+          f"RF={sk_r2_score(y_train, oof_rf):.4f}, "
+          f"XGB={sk_r2_score(y_train, oof_xgb):.4f}", flush=True)
     if catboost_template is not None:
-        print(f"[oof]                   CB={r2_score(y_train, oof_cat):.4f}", flush=True)
+        print(f"[oof]                   CB={sk_r2_score(y_train, oof_cat):.4f}", flush=True)
     if lgb_template is not None:
-        print(f"[oof]                   LGB={r2_score(y_train, oof_lgb):.4f}", flush=True)
+        print(f"[oof]                   LGB={sk_r2_score(y_train, oof_lgb):.4f}", flush=True)
 
     # Build meta-feature matrix and label list
     meta_cols  = [oof_rf, oof_xgb]
@@ -345,12 +356,6 @@ def generate_oof_predictions(X_train: np.ndarray, y_train: np.ndarray,
         meta_labels.append("LightGBM")
 
     return np.column_stack(meta_cols), meta_labels
-
-
-def r2_score(y_true, y_pred):
-    """Convenience wrapper for sklearn r2_score (avoids star-import)."""
-    from sklearn.metrics import r2_score as _r2
-    return _r2(y_true, y_pred)
 
 
 # -- Meta-learner training ------------------------------------------------------
@@ -390,8 +395,6 @@ def evaluate_stacked(rf_final, xgb_final, cat_final, lgb_final,
     Evaluate all base models and the stacked ensemble on the held-out test set.
     Reports individual base model performance so we can measure stacking gain.
     """
-    from sklearn.metrics import r2_score as _r2
-
     # Collect base model test predictions
     base_preds = {
         "RF":  rf_final.predict(X_test),
@@ -409,7 +412,7 @@ def evaluate_stacked(rf_final, xgb_final, cat_final, lgb_final,
     def metrics(y_true, y_pred, name):
         """Compute and print RMSE, R², MAE for one model."""
         rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-        r2   = _r2(y_true, y_pred)
+        r2   = sk_r2_score(y_true, y_pred)
         mae  = mean_absolute_error(y_true, y_pred)
         print(f"\n[eval] {name}:", flush=True)
         print(f"  R²   : {r2:.4f}", flush=True)
@@ -512,7 +515,6 @@ def main():
     )
 
     # Report stacking gain
-    from sklearn.metrics import r2_score as _r2
     print("\n=== SUMMARY ===", flush=True)
     print(perf_df[["model", "test_r2", "test_rmse_log"]].to_string(index=False), flush=True)
     stacked_r2  = perf_df[perf_df["model"].str.startswith("Stacked")]["test_r2"].values[0]
@@ -542,7 +544,7 @@ def main():
         "meta_labels":  meta_labels,
         "imputer":      full_imputer,
         "feature_cols": feature_cols,
-        "model_name":   f"Stacked_{'_'.join(meta_labels)}_Ridge_v4",
+        "model_name":   f"Stacked_{'_'.join(meta_labels)}_Ridge_v5",
         "include_lgb":  use_lgb,
     }
     joblib.dump(bundle, STACKED_MODEL_PATH)
