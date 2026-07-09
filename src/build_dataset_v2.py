@@ -29,6 +29,7 @@ Run from project root:
 """
 
 import os
+import numpy as np
 import pandas as pd
 from sklearn.model_selection import GroupShuffleSplit
 
@@ -37,10 +38,28 @@ DATAPOINTS_CSV  = os.path.join("data", "raw",       "all_co2_datapoints_merged.c
 FEATURES_V2_CSV = os.path.join("data", "processed", "il_features_v2.csv")
 OUTPUT_DIR      = os.path.join("data", "processed")
 
-TARGET_COL         = "log_x2_CO2"
+RAW_TARGET_COL     = "x2_CO2"        # original mole fraction column in datapoints CSV
+TARGET_COL         = "log_x2_CO2"    # log10-transformed target used by all models
 CONDITION_FEATURES = ["T_K", "P_kPa"]
 TRAIN_FRACTION      = 0.80
 RANDOM_SEED         = 42
+
+
+def add_log_target(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add log10(x2_CO2) as the ML target column, matching the original
+    build_dataset.py convention. Rows with x2_CO2 <= 0 are dropped
+    (cannot take log of zero or negative values).
+    """
+    before = len(df)
+    df = df[df[RAW_TARGET_COL] > 0].copy()
+    dropped = before - len(df)
+    if dropped > 0:
+        print(f"  [log_target] Dropped {dropped} rows with x2_CO2 <= 0", flush=True)
+    df[TARGET_COL] = np.log10(df[RAW_TARGET_COL])
+    print(f"  [log_target] {TARGET_COL} range: "
+          f"{df[TARGET_COL].min():.3f} to {df[TARGET_COL].max():.3f}", flush=True)
+    return df
 
 
 def get_variant_columns(all_feature_cols: list) -> dict:
@@ -55,7 +74,6 @@ def get_variant_columns(all_feature_cols: list) -> dict:
       pair_{feat}                         -- ion-pair cross features
       cat_mordred_{desc}, an_mordred_{desc} -- Mordred descriptors
     """
-    # Baseline: Morgan FP bits + RDKit 18 descriptors only
     baseline_cols = [
         c for c in all_feature_cols
         if ("_fp_" in c)
@@ -67,7 +85,6 @@ def get_variant_columns(all_feature_cols: list) -> dict:
             and "_mordred_" not in c
         )
     ]
-
     maccs_cols   = [c for c in all_feature_cols if "_maccs_" in c]
     elec_cols    = [c for c in all_feature_cols if "_elec_" in c]
     cross_cols   = [c for c in all_feature_cols if c.startswith("pair_")]
@@ -86,7 +103,7 @@ def merge_datapoints_with_features(datapoints_df: pd.DataFrame,
                                     features_df: pd.DataFrame) -> pd.DataFrame:
     """
     Left-join CO2 datapoints onto IL features on il_smiles.
-    Drops rows where the IL had no matching features and rows missing T_K/P_kPa.
+    Drops rows with missing T_K or P_kPa (required model inputs).
     """
     merged = datapoints_df.merge(features_df, on="il_smiles", how="left")
     before = len(merged)
@@ -111,10 +128,11 @@ def split_by_il(merged_df: pd.DataFrame) -> tuple:
     train_df = merged_df.iloc[train_idx].copy()
     test_df  = merged_df.iloc[test_idx].copy()
 
-    print(f"  Train: {len(train_df)} rows, {train_df['il_smiles'].nunique()} ILs", flush=True)
-    print(f"  Test:  {len(test_df)} rows,  {test_df['il_smiles'].nunique()} ILs", flush=True)
+    print(f"  Train: {len(train_df)} rows, {train_df['il_smiles'].nunique()} ILs",
+          flush=True)
+    print(f"  Test:  {len(test_df)} rows,  {test_df['il_smiles'].nunique()} ILs",
+          flush=True)
 
-    # Sanity check: confirm no IL appears in both splits
     overlap = set(train_df["il_smiles"]) & set(test_df["il_smiles"])
     assert len(overlap) == 0, f"IL LEAKAGE: {len(overlap)} ILs in both train and test!"
     return train_df, test_df
@@ -143,7 +161,7 @@ def save_variant(train_df: pd.DataFrame, test_df: pd.DataFrame,
 
 
 def main():
-    """Load datapoints + features, merge, split by IL, write all 5 variant CSVs."""
+    """Load datapoints + features, merge, add log target, split by IL, write all 5 variant CSVs."""
     print("=" * 65, flush=True)
     print("build_dataset_v2.py -- producing all feature variant datasets", flush=True)
     print("=" * 65, flush=True)
@@ -160,6 +178,11 @@ def main():
     print(f"  {len(datapoints_df)} rows, {datapoints_df['il_smiles'].nunique()} unique ILs",
           flush=True)
 
+    # Add log10 target -- this was missing from the previous version
+    # and caused KeyError: 'log_x2_CO2' in ablate_feature_sets.py
+    print("\n[log_target] Adding log10(x2_CO2) target column...", flush=True)
+    datapoints_df = add_log_target(datapoints_df)
+
     print(f"\n[load] Features v2: {FEATURES_V2_CSV}", flush=True)
     features_df = pd.read_csv(FEATURES_V2_CSV)
     print(f"  {len(features_df)} ILs, {features_df.shape[1]} columns", flush=True)
@@ -170,7 +193,6 @@ def main():
     print("\n[split] Splitting by IL identity...", flush=True)
     train_df, test_df = split_by_il(merged_df)
 
-    # Identify feature columns per variant (exclude metadata columns)
     all_feature_cols = [
         c for c in features_df.columns
         if c not in ("il_smiles", "il_name", "cation_smiles", "anion_smiles")
