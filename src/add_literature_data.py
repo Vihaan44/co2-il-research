@@ -1,400 +1,345 @@
 """
 add_literature_data.py
-----------------------
-PURPOSE: Convert Ramdin 2015 literature data (Henry's constants + direct mole
-         fraction measurements) into the same format as all_co2_datapoints_merged.csv,
-         then append it to produce an expanded dataset for retraining.
+-----------------------
+PURPOSE: Merge manually-extracted literature CO2/IL solubility data
+         (from Shiflett, Jacquemin, and other groups not in ILThermo)
+         into the main datapoints CSV, then rebuild train/test splits.
 
-WHY THIS DATA MATTERS:
-  The compare_models.py run showed RF test R²=0.704 while all boosting methods
-  collapsed to 0.57-0.62 on held-out ILs. This is a data coverage problem: the
-  60 test ILs are structurally different from the 239 training ILs. Adding 11
-  new ILs (69 rows) from Ramdin 2015 expands structural diversity and may
-  partially close the test gap.
+WHY EXPERIMENTAL LITERATURE DATA (not computational):
+  COSMO-RS predicted CO2/IL solubility data has 15-30% systematic error
+  vs experiment, with anion-type-dependent bias. Mixing it with experimental
+  data would teach the model a blend of two different physical quantities.
+  This script ONLY accepts experimental (measured) data.
 
-DATA SOURCES IN data.md:
-  Two property types require different handling:
+WHAT YOU NEED TO PROVIDE:
+  Create data/raw/literature_co2_data.csv with the following columns:
+    il_smiles   -- canonical RDKit SMILES (dot-separated cation.anion)
+    il_name     -- human-readable name (e.g. [BMIM][Tf2N])
+    T_K         -- temperature in Kelvin
+    P_kPa       -- CO2 partial pressure in kPa
+    x2_CO2      -- mole fraction CO2 solubility (NOT log-transformed)
+    source      -- citation (e.g. Shiflett2005_JPCB)
+    data_source -- always "literature" for this file
 
-  1. henry (H in MPa, no P_kPa):
-     Conversion: x2 = P_ref / H
-     where P_ref = P_REFERENCE_KPA (101.325 kPa = 1 atm standard condition).
-     Derivation: Henry's law at infinite dilution states H = P_CO2 / x2,
-     so x2 = P_CO2 / H. At the standard reporting condition P_CO2 = 1 atm,
-     x2 = 101.325 kPa / H(kPa). This gives the mole fraction solubility
-     at 1 atm partial pressure of CO2 -- directly comparable to ILThermo
-     data collected near atmospheric pressure.
-     P_kPa in output is set to P_REFERENCE_KPA so the model sees a real
-     pressure value, not NaN (which would cause the row to be dropped).
+HOW TO GET THE DATA (step by step):
 
-  2. mole_fraction (x2 already measured, P_kPa provided):
-     Use x2 directly. Apply P > P_MAX_KPA cutoff to exclude supercritical
-     measurements that are outside the training distribution.
+  1. SHIFLETT GROUP (most valuable -- ILs not in ILThermo)
+     Search: https://scholar.google.com/scholar?q=Shiflett+CO2+ionic+liquid+solubility
+     Key papers:
+       - Shiflett & Yokozeki (2005) J. Phys. Chem. B 109, 19597
+       - Shiflett & Yokozeki (2008) Energy Fuels 22, 2585
+       - Shiflett et al. (2010) ChemSusChem 3, 1086
+     For each paper: find the (T, P, x2) data table. Use Tabula
+     (https://tabula.technology/) to extract PDF tables automatically.
 
-EXCLUSION RULES (applied before conversion):
-  - calculated_not_measured: [toa][Tf2N] rows are COSMO-RS predictions,
-    not experimental data. Including calculated values as training data
-    would bias the model toward computational artifacts.
-  - SMILES_verify: [cprop] cation SMILES is unusual and unvalidated.
-    RDKit may fail or produce wrong descriptors. Exclude until verified.
-  - single_T_point: [bmim][Tf2N] henry row is a single point from a
-    secondary source -- likely already in ILThermo dataset as a duplicate.
-  - secondary_source without check_ILThermo cleared: [thtdp] rows sourced
-    from Ramdin reference [346] (not measured by Ramdin directly). Kept
-    because [thtdp] phosphonium ILs are structurally distinct and add
-    genuine diversity. Flag retained in data_source column.
-  - T > T_MAX_K: measurements above 340K are outside the typical operating
-    range for CO2 capture and outside the ILThermo training distribution.
-    Excluded to avoid T extrapolation artifacts.
+  2. JACQUEMIN GROUP
+     Search: https://scholar.google.com/scholar?q=Jacquemin+CO2+ionic+liquid+mole+fraction
+     Key papers 2006-2012. Same extraction process.
 
-OUTPUT:
-  data/raw/all_co2_datapoints_expanded.csv  -- original + Ramdin rows
-  results/literature_integration_report.csv -- what was added/excluded
+  3. CHECK ILTHERMO FOR RECENT ADDITIONS
+     https://ilthermo.boulder.nist.gov/
+     Search: Component 1 = CO2, Property = Mole fraction, Phase = Liquid
+     Download all results -- ILThermo is updated regularly.
 
-IMPORTANT: After running this script, you MUST rerun the full pipeline:
-  python src/featurize.py          (if new ILs have new SMILES)
-  python src/build_dataset.py      (point DATAPOINTS_CSV at expanded file)
-  python src/compare_models.py     (check whether test R² improved)
+  4. CANONICALIZE SMILES for each new IL:
+     python3 -c "
+     from rdkit import Chem
+     smi = 'your_smiles_here'
+     print(Chem.MolToSmiles(Chem.MolFromSmiles(smi)))
+     "
+     Or use: https://cactus.nci.nih.gov/translate/
 
-Run from project root:
+  5. CHECK FOR DUPLICATES before adding:
+     Run this script with --check-only flag to see which new ILs
+     are genuinely new vs already in the existing dataset.
+
+ONCE YOU HAVE literature_co2_data.csv:
   python src/add_literature_data.py
+  python src/featurize.py         # featurize new ILs
+  python src/build_dataset.py     # rebuild train/test with new ILs
+  nohup python src/nested_cv_model_comparison.py > logs/nested_cv_v2.log 2>&1 &
+
+OUTPUTS:
+  data/raw/all_co2_datapoints_v2.csv  -- merged datapoints
+  results/literature_merge_summary.csv -- what was added, what was duplicate
 """
 
 import os
-import pandas as pd
+import sys
+import argparse
 import numpy as np
+import pandas as pd
+from rdkit import Chem
 
 # -- Constants -----------------------------------------------------------------
-SOURCE_CSV    = os.path.join("data", "raw", "all_co2_datapoints_merged.csv")
-LITERATURE_MD = os.path.join("data", "raw", "ramdin_2015_literature.md")
-OUTPUT_CSV    = os.path.join("data", "raw", "all_co2_datapoints_expanded.csv")
-REPORT_CSV    = os.path.join("results", "literature_integration_report.csv")
+EXISTING_CSV    = os.path.join("data", "raw", "all_co2_datapoints_merged.csv")
+LITERATURE_CSV  = os.path.join("data", "raw", "literature_co2_data.csv")
+OUTPUT_CSV      = os.path.join("data", "raw", "all_co2_datapoints_v2.csv")
+SUMMARY_CSV     = os.path.join("results", "literature_merge_summary.csv")
 
-# Henry's law reference pressure for x2 conversion
-# x2 = P_ref / H(kPa). Use 1 atm so output is comparable to near-atmospheric
-# ILThermo measurements. Do NOT use a higher pressure -- that would overestimate
-# solubility and introduce systematic bias relative to training data.
-P_REFERENCE_KPA = 101.325
+REQUIRED_COLS = ["il_smiles", "il_name", "T_K", "P_kPa", "x2_CO2", "source"]
 
-# Exclude measurements above this temperature -- outside ILThermo training range
-T_MAX_K = 340.0
-
-# Exclude mole fraction rows at very high pressure (supercritical regime,
-# outside Henry's law linearity, outside ILThermo training distribution)
-P_MAX_KPA = 2000.0
-
-# Flag substrings that trigger row exclusion
-EXCLUDE_FLAGS = [
-    "calculated_not_measured",  # COSMO-RS predictions, not experimental
-    "SMILES_verify",            # unvalidated unusual cation SMILES
-    "single_T_point",           # secondary single-point, likely ILThermo duplicate
-]
-
-DATA_SOURCE_LABEL = "ramdin_2015_literature"
+# Duplicate detection tolerance:
+# Two rows are duplicates if same IL + T within 0.5K + P within 0.5kPa
+TEMP_TOL_K   = 0.5
+PRESS_TOL_KPA = 0.5
+X2_TOL        = 0.005   # mole fraction tolerance for reporting near-duplicates
 
 
-def load_existing_data(path: str) -> pd.DataFrame:
-    """Load the existing merged datapoints CSV."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Source CSV not found: {path}\n"
-            "Run src/merge_thermoml_into_pipeline.py first."
-        )
-    df = pd.read_csv(path)
-    print(f"[load] Existing dataset: {len(df)} rows, "
-          f"{df['il_smiles'].nunique()} unique ILs", flush=True)
-    return df
-
-
-def parse_literature_md(path: str) -> pd.DataFrame:
+def canonicalize_smiles(smiles: str) -> str:
     """
-    Parse the Ramdin 2015 markdown table into a DataFrame.
-    Expects pipe-delimited markdown table with header row and separator row.
+    Convert SMILES to RDKit canonical form for consistent comparison.
+    Returns empty string if RDKit cannot parse the SMILES.
+    This is critical: the same IL can have many valid SMILES representations;
+    canonicalization ensures we detect duplicates reliably.
     """
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Literature markdown not found: {path}\n"
-            "Save data/raw/ramdin_2015_literature.md from the extracted data."
+    if not smiles or not isinstance(smiles, str):
+        return ""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        print(f"  [DATA QUALITY] Cannot parse SMILES: {smiles[:60]}", flush=True)
+        return ""
+    return Chem.MolToSmiles(mol)
+
+
+def validate_literature_csv(lit_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Check the literature CSV for required columns, valid SMILES,
+    and sensible physical values. Returns cleaned DataFrame.
+    """
+    print("[validate] Checking literature CSV...", flush=True)
+
+    # Check required columns
+    missing_cols = [c for c in REQUIRED_COLS if c not in lit_df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"literature_co2_data.csv is missing required columns: {missing_cols}\n"
+            f"See script docstring for the required column list."
         )
 
-    rows = []
-    with open(path) as f:
-        lines = f.readlines()
+    original_len = len(lit_df)
 
-    for line in lines:
-        line = line.strip()
-        if not line.startswith("|") or "---" in line:
-            continue  # skip separator rows and non-table lines
-        cols = [c.strip() for c in line.split("|")[1:-1]]  # strip outer pipes
-        rows.append(cols)
-
-    if len(rows) < 2:
-        raise ValueError("Could not parse any rows from literature markdown.")
-
-    header = rows[0]
-    data   = rows[1:]
-    df     = pd.DataFrame(data, columns=header)
-    print(f"[parse_md] Parsed {len(df)} rows from markdown table", flush=True)
-    return df
-
-
-def apply_exclusion_rules(df: pd.DataFrame) -> tuple:
-    """
-    Remove rows that should not be used for training.
-    Returns (kept_df, excluded_df) with an 'exclusion_reason' column on excluded_df.
-    """
-    excluded_rows = []
-    keep_mask     = pd.Series([True] * len(df), index=df.index)
-
-    for flag_substring in EXCLUDE_FLAGS:
-        flagged = df["flags"].fillna("").str.contains(flag_substring, case=False)
-        newly_excluded = df[flagged & keep_mask].copy()
-        newly_excluded["exclusion_reason"] = f"flag:{flag_substring}"
-        excluded_rows.append(newly_excluded)
-        keep_mask = keep_mask & ~flagged
-        print(f"[exclude] flag '{flag_substring}': {flagged.sum()} rows excluded",
+    # Canonicalize SMILES
+    print("  Canonicalizing SMILES...", flush=True)
+    lit_df["il_smiles"] = lit_df["il_smiles"].apply(canonicalize_smiles)
+    bad_smiles = lit_df["il_smiles"] == ""
+    if bad_smiles.any():
+        print(f"  [DATA QUALITY] {bad_smiles.sum()} rows have unparseable SMILES -- dropping",
               flush=True)
+        lit_df = lit_df[~bad_smiles].copy()
 
-    # Exclude T > T_MAX_K
-    high_t = df["T_K"].astype(float) > T_MAX_K
-    newly_excluded = df[high_t & keep_mask].copy()
-    newly_excluded["exclusion_reason"] = f"T>{T_MAX_K}K"
-    excluded_rows.append(newly_excluded)
-    keep_mask = keep_mask & ~high_t
-    print(f"[exclude] T > {T_MAX_K}K: {high_t.sum()} rows excluded", flush=True)
+    # Physical value sanity checks
+    bad_temp  = (lit_df["T_K"] < 200) | (lit_df["T_K"] > 500)
+    bad_press = (lit_df["P_kPa"] < 0) | (lit_df["P_kPa"] > 100000)
+    bad_x2    = (lit_df["x2_CO2"] <= 0) | (lit_df["x2_CO2"] > 1)
 
-    kept_df     = df[keep_mask].copy()
-    excluded_df = pd.concat(excluded_rows, ignore_index=True) if excluded_rows else pd.DataFrame()
+    if bad_temp.any():
+        print(f"  [DATA QUALITY] {bad_temp.sum()} rows with T_K outside 200-500K -- dropping",
+              flush=True)
+        lit_df = lit_df[~bad_temp].copy()
+    if bad_press.any():
+        print(f"  [DATA QUALITY] {bad_press.sum()} rows with P_kPa outside 0-100000 -- dropping",
+              flush=True)
+        lit_df = lit_df[~bad_press].copy()
+    if bad_x2.any():
+        print(f"  [DATA QUALITY] {bad_x2.sum()} rows with x2_CO2 outside (0,1] -- dropping",
+              flush=True)
+        lit_df = lit_df[~bad_x2].copy()
 
-    print(f"[exclude] Kept {len(kept_df)} / {len(df)} rows after exclusions",
+    lit_df["data_source"] = "literature"
+    print(f"  Validated: {len(lit_df)}/{original_len} rows pass all checks", flush=True)
+    return lit_df
+
+
+def find_duplicates(existing_df: pd.DataFrame,
+                    lit_df: pd.DataFrame) -> tuple:
+    """
+    Identify rows in lit_df that are already in existing_df (same IL + T + P).
+    Returns (new_rows_df, duplicate_rows_df, near_duplicate_df).
+
+    We match on:
+      - Exact canonical SMILES match (same IL identity)
+      - T_K within TEMP_TOL_K (0.5K)
+      - P_kPa within PRESS_TOL_KPA (0.5 kPa)
+
+    Near-duplicates (same T/P but different x2 by more than X2_TOL)
+    are flagged separately -- they suggest a measurement conflict and
+    should be reviewed before adding.
+    """
+    print("\n[duplicates] Checking for duplicates vs existing dataset...", flush=True)
+
+    new_rows   = []
+    duplicates = []
+    near_dups  = []
+
+    for _, lit_row in lit_df.iterrows():
+        smi = lit_row["il_smiles"]
+        # Find existing rows with the same IL
+        same_il = existing_df[existing_df["il_smiles"] == smi]
+        if same_il.empty:
+            new_rows.append(lit_row)
+            continue
+
+        # Check T, P proximity
+        same_cond = same_il[
+            (abs(same_il["T_K"]    - lit_row["T_K"])    < TEMP_TOL_K) &
+            (abs(same_il["P_kPa"] - lit_row["P_kPa"]) < PRESS_TOL_KPA)
+        ]
+
+        if same_cond.empty:
+            # Same IL, different T/P condition -- genuine new data point
+            new_rows.append(lit_row)
+        else:
+            # Same IL + T + P -- check if x2 agrees
+            x2_diff = abs(same_cond["x2_CO2"].values[0] - lit_row["x2_CO2"])
+            if x2_diff > X2_TOL:
+                lit_row_copy = lit_row.copy()
+                lit_row_copy["existing_x2"]   = same_cond["x2_CO2"].values[0]
+                lit_row_copy["existing_source"] = same_cond.get("data_source",
+                                                   pd.Series(["unknown"])).values[0]
+                lit_row_copy["x2_difference"]  = x2_diff
+                near_dups.append(lit_row_copy)
+            else:
+                duplicates.append(lit_row)
+
+    new_df     = pd.DataFrame(new_rows)
+    dup_df     = pd.DataFrame(duplicates)
+    near_df    = pd.DataFrame(near_dups)
+
+    print(f"  Genuine new rows:      {len(new_df)}", flush=True)
+    print(f"  Exact duplicates:      {len(dup_df)} (will be skipped)", flush=True)
+    print(f"  Near-duplicates:       {len(near_df)} (x2 differs >0.005, review)",
           flush=True)
-    return kept_df, excluded_df
+
+    if not near_df.empty:
+        print("\n  Near-duplicate details (check these manually):", flush=True)
+        for _, row in near_df.iterrows():
+            print(f"    {row['il_name']} T={row['T_K']}K P={row['P_kPa']}kPa: "
+                  f"new x2={row['x2_CO2']:.4f}, existing x2={row['existing_x2']:.4f}, "
+                  f"diff={row['x2_difference']:.4f}", flush=True)
+        print("  Near-duplicates will be EXCLUDED pending manual review.", flush=True)
+
+    return new_df, dup_df, near_df
 
 
-def convert_henry_to_x2(df_henry: pd.DataFrame) -> pd.DataFrame:
+def report_new_ils(existing_df: pd.DataFrame, new_df: pd.DataFrame):
     """
-    Convert Henry's constant rows (H in MPa, no P) to mole fraction rows.
-
-    Conversion: x2 = P_ref_kPa / (H_MPa * 1000)
-    Derivation: H = P_CO2 / x2  =>  x2 = P_CO2 / H
-    P_ref = 101.325 kPa = 0.101325 MPa (1 atm standard condition)
-    H in MPa -> H_kPa = H_MPa * 1000
-    x2 = 101.325 / H_kPa
-
-    Sets P_kPa = P_REFERENCE_KPA so build_dataset.py doesn't drop the row
-    for missing pressure (which is a required condition column).
+    Print a summary of which ILs are genuinely new vs which are additional
+    T/P conditions for ILs already in the dataset.
     """
-    df = df_henry.copy()
+    if new_df.empty:
+        print("\n[summary] No new rows to add.", flush=True)
+        return
 
-    h_mpa = df["value"].astype(float)
-    h_kpa = h_mpa * 1000.0                         # MPa -> kPa
-    x2    = P_REFERENCE_KPA / h_kpa                # Henry's law inversion
-
-    # Sanity check: x2 must be in (0, 1)
-    bad = (x2 <= 0) | (x2 >= 1)
-    if bad.any():
-        print(f"[henry_convert] WARNING: {bad.sum()} rows produced x2 outside (0,1) "
-              f"-- will be dropped by build_dataset.py log transform check", flush=True)
-        print(df[bad][["il_name", "value", "T_K"]].to_string(), flush=True)
-
-    df["x2_CO2"]  = x2
-    df["P_kPa"]   = P_REFERENCE_KPA   # reference pressure for Henry's law measurement
-    df["T_K"]     = df["T_K"].astype(float)
-
-    print(f"[henry_convert] Converted {len(df)} Henry rows to x2 "
-          f"(range: {x2.min():.4f} – {x2.max():.4f})", flush=True)
-    return df
-
-
-def convert_mole_fraction_rows(df_mf: pd.DataFrame) -> pd.DataFrame:
-    """
-    Handle direct mole fraction rows (x2 already measured, P_kPa provided).
-    Drop rows above P_MAX_KPA (supercritical / outside Henry's law linearity).
-    """
-    df = df_mf.copy()
-    df["P_kPa"]  = pd.to_numeric(df["P_kPa"], errors="coerce")
-    df["x2_CO2"] = pd.to_numeric(df["value"],  errors="coerce")
-    df["T_K"]    = df["T_K"].astype(float)
-
-    high_p = df["P_kPa"] > P_MAX_KPA
-    if high_p.any():
-        print(f"[mf_convert] Dropping {high_p.sum()} rows with P > {P_MAX_KPA} kPa",
-              flush=True)
-    df = df[~high_p].copy()
-
-    print(f"[mf_convert] Kept {len(df)} direct mole fraction rows", flush=True)
-    return df
-
-
-def format_for_merge(df: pd.DataFrame, existing_cols: list) -> pd.DataFrame:
-    """
-    Build output rows matching the schema of all_co2_datapoints_merged.csv:
-      il_name, il_smiles, T_K, P_kPa, x2_CO2, data_source, p_imputed
-    """
-    # Construct il_smiles from cation + anion SMILES (dot-separated, matching ILThermo format)
-    df["il_smiles"] = df["cation_smiles"].str.strip() + "." + df["anion_smiles"].str.strip()
-
-    output = pd.DataFrame({
-        "il_name":     df["il_name"],
-        "il_smiles":   df["il_smiles"],
-        "T_K":         df["T_K"],
-        "P_kPa":       df["P_kPa"],
-        "x2_CO2":      df["x2_CO2"],
-        "data_source": DATA_SOURCE_LABEL,
-        "p_imputed":   0,   # pressure is real (either measured or set to P_ref for Henry)
-    })
-
-    # Add any extra columns in existing data that we don't have (fill with NaN)
-    for col in existing_cols:
-        if col not in output.columns:
-            output[col] = np.nan
-
-    return output[existing_cols]   # enforce column order
-
-
-def check_for_duplicates(new_rows: pd.DataFrame,
-                          existing_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Flag any new IL SMILES that already appear in the existing dataset.
-    These are likely ILThermo duplicates -- keep them but warn so they can
-    be reviewed. Exact (il_smiles, T_K, P_kPa) duplicates are dropped.
-    """
     existing_smiles = set(existing_df["il_smiles"].unique())
-    new_smiles      = set(new_rows["il_smiles"].unique())
-    overlap         = new_smiles & existing_smiles
+    new_smiles      = set(new_df["il_smiles"].unique())
+    truly_new_ils   = new_smiles - existing_smiles
+    extra_cond_ils  = new_smiles & existing_smiles
 
-    if overlap:
-        print(f"\n[dup_check] WARNING: {len(overlap)} new IL SMILES already exist "
-              f"in training data:", flush=True)
-        for s in sorted(overlap):
-            print(f"  {s}", flush=True)
-        print("  These ILs won't add structural diversity but may add T/P coverage.",
-              flush=True)
-
-    # Drop exact (SMILES, T, P) duplicates
-    merge_key = ["il_smiles", "T_K", "P_kPa"]
-    before    = len(new_rows)
-    combined  = pd.concat([existing_df[merge_key].assign(_existing=True),
-                            new_rows[merge_key].assign(_existing=False)])
-    exact_dups = combined.duplicated(subset=merge_key, keep="first")
-    dup_smiles_tp = set(
-        combined[exact_dups & ~combined["_existing"]]["il_smiles"]
-    )
-    new_rows = new_rows[~new_rows["il_smiles"].isin(dup_smiles_tp) |
-                        ~new_rows.set_index(merge_key).index.isin(
-                            existing_df.set_index(merge_key).index
-                        )].copy()
-
-    # Simpler approach: drop rows where (il_smiles, T_K, P_kPa) already exists
-    existing_keys = set(
-        zip(existing_df["il_smiles"], existing_df["T_K"], existing_df["P_kPa"])
-    )
-    new_rows["_key"] = list(zip(new_rows["il_smiles"], new_rows["T_K"], new_rows["P_kPa"]))
-    exact_dup_mask   = new_rows["_key"].isin(existing_keys)
-    if exact_dup_mask.any():
-        print(f"[dup_check] Dropping {exact_dup_mask.sum()} exact (SMILES, T, P) "
-              f"duplicates", flush=True)
-    new_rows = new_rows[~exact_dup_mask].drop(columns=["_key"])
-
-    print(f"[dup_check] {len(new_rows)} / {before} new rows are non-duplicate",
+    print(f"\n[summary] New data breakdown:", flush=True)
+    print(f"  Truly new ILs (not in existing dataset): {len(truly_new_ils)}",
           flush=True)
-    return new_rows
+    for smi in sorted(truly_new_ils):
+        name = new_df[new_df["il_smiles"] == smi]["il_name"].values[0]
+        n_rows = (new_df["il_smiles"] == smi).sum()
+        print(f"    {name}: {n_rows} new (T,P) measurements", flush=True)
+
+    print(f"  Existing ILs with new (T,P) conditions: {len(extra_cond_ils)}",
+          flush=True)
+    for smi in sorted(extra_cond_ils):
+        name = new_df[new_df["il_smiles"] == smi]["il_name"].values[0]
+        n_rows = (new_df["il_smiles"] == smi).sum()
+        print(f"    {name}: {n_rows} additional (T,P) measurements", flush=True)
+
+    print(f"\n  Expected impact: +{len(truly_new_ils)} ILs in training pool "
+          f"(currently 299, target >310 for meaningful R2 improvement)",
+          flush=True)
 
 
 def main():
-    """
-    Full integration pipeline:
-    1. Load existing dataset
-    2. Parse Ramdin 2015 markdown table
-    3. Apply exclusion rules
-    4. Convert henry -> x2 and filter mole_fraction rows
-    5. Duplicate check
-    6. Append to existing dataset -> save expanded CSV
-    """
-    os.makedirs(os.path.join("data", "raw"), exist_ok=True)
-    os.makedirs("results", exist_ok=True)
+    """Load existing data, validate and merge literature CSV, save merged output."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check-only", action="store_true",
+                        help="Report what would be added without writing output files")
+    args = parser.parse_args()
 
-    print("=== RAMDIN 2015 LITERATURE DATA INTEGRATION ===\n", flush=True)
+    print("=" * 65, flush=True)
+    print("add_literature_data.py", flush=True)
+    print("=" * 65, flush=True)
 
-    # Step 1: Load existing data
-    existing_df = load_existing_data(SOURCE_CSV)
+    if not os.path.exists(EXISTING_CSV):
+        raise FileNotFoundError(f"Existing datapoints not found: {EXISTING_CSV}")
 
-    # Step 2: Parse literature markdown
-    lit_df = parse_literature_md(LITERATURE_MD)
+    if not os.path.exists(LITERATURE_CSV):
+        print(f"\n[main] literature_co2_data.csv not found at:", flush=True)
+        print(f"  {LITERATURE_CSV}", flush=True)
+        print("\nSee script docstring for step-by-step extraction instructions.",
+              flush=True)
+        print("Create the CSV with these columns:", flush=True)
+        print(f"  {REQUIRED_COLS}", flush=True)
+        sys.exit(0)
 
-    # Step 3: Apply exclusion rules
-    kept_df, excluded_df = apply_exclusion_rules(lit_df)
-
-    # Step 4: Split by property type and convert
-    henry_rows = kept_df[kept_df["property_type"] == "henry"].copy()
-    mf_rows    = kept_df[kept_df["property_type"] == "mole_fraction"].copy()
-
-    print(f"\n[split] {len(henry_rows)} henry rows, {len(mf_rows)} mole_fraction rows",
+    print(f"\n[load] Existing data: {EXISTING_CSV}", flush=True)
+    existing_df = pd.read_csv(EXISTING_CSV)
+    # Canonicalize existing SMILES for consistent comparison
+    existing_df["il_smiles"] = existing_df["il_smiles"].apply(canonicalize_smiles)
+    existing_df = existing_df[existing_df["il_smiles"] != ""].copy()
+    print(f"  {len(existing_df)} rows, {existing_df['il_smiles'].nunique()} unique ILs",
           flush=True)
 
-    converted_rows = []
-    if len(henry_rows):
-        converted_rows.append(convert_henry_to_x2(henry_rows))
-    if len(mf_rows):
-        converted_rows.append(convert_mole_fraction_rows(mf_rows))
+    print(f"\n[load] Literature data: {LITERATURE_CSV}", flush=True)
+    lit_df = pd.read_csv(LITERATURE_CSV)
+    print(f"  {len(lit_df)} rows", flush=True)
 
-    if not converted_rows:
-        print("[main] No usable rows after exclusions. Exiting.", flush=True)
-        return
+    # Validate
+    lit_df = validate_literature_csv(lit_df)
 
-    new_data_df = pd.concat(converted_rows, ignore_index=True)
+    # Find duplicates
+    new_df, dup_df, near_df = find_duplicates(existing_df, lit_df)
 
-    # Step 5: Format to match existing schema
-    new_formatted = format_for_merge(new_data_df, list(existing_df.columns))
+    # Report
+    report_new_ils(existing_df, new_df)
 
-    # Step 6: Duplicate check
-    new_formatted = check_for_duplicates(new_formatted, existing_df)
+    if args.check_only:
+        print("\n[main] --check-only mode: no files written.", flush=True)
+        sys.exit(0)
 
-    # Step 7: Append and save
-    expanded_df = pd.concat([existing_df, new_formatted], ignore_index=True)
+    if new_df.empty:
+        print("\n[main] Nothing new to add. Exiting.", flush=True)
+        sys.exit(0)
 
-    new_ils = new_formatted["il_smiles"].nunique()
-    print(f"\n=== INTEGRATION SUMMARY ===", flush=True)
-    print(f"  Original rows:     {len(existing_df)}", flush=True)
-    print(f"  New rows added:    {len(new_formatted)}", flush=True)
-    print(f"  New unique ILs:    {new_ils}", flush=True)
-    print(f"  Expanded rows:     {len(expanded_df)}", flush=True)
-    print(f"  Expanded ILs:      {expanded_df['il_smiles'].nunique()}", flush=True)
-    print(f"  Excluded rows:     {len(excluded_df)}", flush=True)
+    # Merge and save
+    merged_df = pd.concat([existing_df, new_df], ignore_index=True)
+    os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
+    merged_df.to_csv(OUTPUT_CSV, index=False)
+    print(f"\n[main] Saved merged data -> {OUTPUT_CSV}", flush=True)
+    print(f"  {len(merged_df)} total rows, {merged_df['il_smiles'].nunique()} unique ILs",
+          flush=True)
 
-    expanded_df.to_csv(OUTPUT_CSV, index=False)
-    print(f"\n[main] Saved: {OUTPUT_CSV}", flush=True)
-
-    # Save integration report for paper/audit trail
-    report_rows = []
-    for _, row in new_formatted.iterrows():
-        report_rows.append({
-            "il_smiles":    row["il_smiles"],
-            "il_name":      row.get("il_name", ""),
-            "T_K":          row["T_K"],
-            "P_kPa":        row["P_kPa"],
-            "x2_CO2":       row["x2_CO2"],
-            "status":       "added",
-        })
-    if len(excluded_df):
-        for _, row in excluded_df.iterrows():
-            report_rows.append({
-                "il_smiles":  row.get("cation_smiles","") + "." + row.get("anion_smiles",""),
-                "il_name":    row.get("il_name", ""),
-                "T_K":        row.get("T_K", ""),
-                "P_kPa":      "N/A",
-                "x2_CO2":     "N/A",
-                "status":     row.get("exclusion_reason", "excluded"),
-            })
-    pd.DataFrame(report_rows).to_csv(REPORT_CSV, index=False)
-    print(f"[main] Saved: {REPORT_CSV}", flush=True)
+    # Save merge summary
+    summary_rows = [
+        {"category": "existing_rows",      "count": len(existing_df)},
+        {"category": "existing_ils",       "count": existing_df["il_smiles"].nunique()},
+        {"category": "literature_rows_in", "count": len(lit_df)},
+        {"category": "exact_duplicates",   "count": len(dup_df)},
+        {"category": "near_duplicates",    "count": len(near_df)},
+        {"category": "new_rows_added",     "count": len(new_df)},
+        {"category": "new_ils_added",      "count": len(set(new_df["il_smiles"]) -
+                                                          set(existing_df["il_smiles"]))},
+        {"category": "total_rows_out",     "count": len(merged_df)},
+        {"category": "total_ils_out",      "count": merged_df["il_smiles"].nunique()},
+    ]
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    pd.DataFrame(summary_rows).to_csv(SUMMARY_CSV, index=False)
+    print(f"[main] Saved merge summary -> {SUMMARY_CSV}", flush=True)
 
     print("\n[main] NEXT STEPS:", flush=True)
-    print("  1. Save data.md as data/raw/ramdin_2015_literature.md", flush=True)
-    print("  2. python src/featurize.py  (featurize any new IL SMILES)", flush=True)
-    print("  3. Edit build_dataset.py: set DATAPOINTS_CSV to all_co2_datapoints_expanded.csv", flush=True)
-    print("  4. python src/build_dataset.py", flush=True)
-    print("  5. python src/compare_models.py  (check if test R² improved)", flush=True)
-    print("[main] DONE.", flush=True)
+    print("  1. python src/featurize.py         # featurize new ILs", flush=True)
+    print("  2. python src/build_dataset.py     # rebuild train/test with new ILs", flush=True)
+    print("  3. nohup python src/nested_cv_model_comparison.py > "
+          "logs/nested_cv_v2.log 2>&1 &", flush=True)
+    print("     (compare R2 vs previous 0.708 to measure literature data impact)",
+          flush=True)
 
 
 if __name__ == "__main__":
