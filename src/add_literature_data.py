@@ -75,7 +75,8 @@ from rdkit import Chem
 EXISTING_CSV    = os.path.join("data", "raw", "all_co2_datapoints_merged.csv")
 LITERATURE_CSV  = os.path.join("data", "raw", "literature_co2_data.csv")
 OUTPUT_CSV      = os.path.join("data", "raw", "all_co2_datapoints_v2.csv")
-SUMMARY_CSV     = os.path.join("results", "literature_merge_summary.csv")
+RESULTS_DIR     = os.path.join("results")
+SUMMARY_CSV     = os.path.join(RESULTS_DIR, "literature_merge_summary.csv")
 
 REQUIRED_COLS = ["il_smiles", "il_name", "T_K", "P_kPa", "x2_CO2", "source"]
 
